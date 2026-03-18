@@ -16,6 +16,7 @@ export default class VaultSyncPlugin extends Plugin {
   settings: VaultSyncSettings = { ...DEFAULT_SETTINGS };
   private syncEngine!: SyncEngine;
   private ribbonEl: HTMLElement | null = null;
+  private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
 
   async onload(): Promise<void> {
@@ -25,11 +26,16 @@ export default class VaultSyncPlugin extends Plugin {
     this.syncEngine.onStateChange = (state) => this.updateState(state);
     this.syncEngine.onError = (msg) => this.handleSyncError(msg);
 
-    // Ribbon icon for sync status
+    // Ribbon icon for sync toggle
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Vault Sync", () => {
       this.toggleSync();
     });
     this.updateRibbonState();
+
+    // Status bar indicator (bottom bar, non-intrusive)
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("vault-sync-statusbar");
+    this.updateStatusBar();
 
     // Settings tab
     this.addSettingTab(new VaultSyncSettingTab(this.app, this));
@@ -143,6 +149,7 @@ export default class VaultSyncPlugin extends Plugin {
   private updateState(state: SyncState): void {
     this.syncState = state;
     this.updateRibbonState();
+    this.updateStatusBar();
   }
 
   private updateRibbonState(): void {
@@ -154,6 +161,21 @@ export default class VaultSyncPlugin extends Plugin {
       .replace(/vault-sync-ribbon/g, "")
       .trim();
     this.ribbonEl.addClass("vault-sync-ribbon");
+  }
+
+  private static readonly STATUS_LABELS: Record<SyncState, string> = {
+    "idle": "\u25CB Sync off",
+    "syncing": "\u25D4 Syncing\u2026",
+    "ok": "\u25CF Synced",
+    "error": "\u25CF Sync error",
+    "offline": "\u25CB Offline",
+    "not-configured": "\u25CB Not configured",
+  };
+
+  private updateStatusBar(): void {
+    if (!this.statusBarEl) return;
+    this.statusBarEl.setText(VaultSyncPlugin.STATUS_LABELS[this.syncState]);
+    this.statusBarEl.dataset.state = this.syncState;
   }
 
   private handleSyncError(msg: string): void {
