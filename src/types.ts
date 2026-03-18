@@ -18,6 +18,12 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 
 export type SyncState = "idle" | "syncing" | "ok" | "error" | "offline" | "not-configured";
 
+export interface SyncCounts {
+  pendingPush: number;
+  pendingPull: number;
+  conflicts: number;
+}
+
 /** Tracks known revision for each doc to detect remote changes */
 export interface RevMap {
   [docId: string]: string;

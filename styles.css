@@ -13,3 +13,4 @@
 .vault-sync-statusbar[data-state="offline"] { opacity: 0.4; }
 .vault-sync-statusbar[data-state="idle"] { opacity: 0.5; }
 .vault-sync-statusbar[data-state="not-configured"] { opacity: 0.3; }
+.vault-sync-statusbar[data-state="conflict"] { color: var(--color-orange); }
