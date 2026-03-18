@@ -21,7 +21,6 @@ export type SyncState = "idle" | "syncing" | "ok" | "error" | "offline" | "not-c
 export interface SyncCounts {
   pendingPush: number;
   pendingPull: number;
-  conflicts: number;
 }
 
 /** Tracks known revision for each doc to detect remote changes */

@@ -31,7 +31,6 @@ export class SyncEngine {
   private applyingRemote = false;
   private running = false;
   private pullCount = 0;
-  private conflictCount = 0;
 
   /** Callback to update UI state */
   onStateChange: (state: SyncState) => void = () => {};
@@ -447,9 +446,9 @@ export class SyncEngine {
   }
 
   /**
-   * Resolve a push conflict: remote was updated by another device.
-   * If content differs, save local version as a conflict file and pull remote.
-   * If content is identical, just update the rev map.
+   * Resolve a push conflict using last-write-wins by mtime.
+   * Fetches the remote version, compares mtime, and the newest version wins.
+   * No conflict files are created - resolution is fully automatic.
    */
   private async resolveConflict(
     path: string,
@@ -465,30 +464,33 @@ export class SyncEngine {
       return;
     }
 
-    // Real conflict: save local version as conflict file so user can merge
-    this.conflictCount++;
-    this.emitCounts();
-
-    const conflictFile = this.conflictPath(path);
-    await this.ensureParentDirs(conflictFile);
-    await this.vault.create(conflictFile, localContent);
-
-    // Apply remote version to the original file
-    const normalized = normalizePath(path);
-    const existing = this.vault.getAbstractFileByPath(normalized);
-    if (existing instanceof TFile) {
-      this.applyingRemote = true;
-      try {
-        await this.vault.modify(existing, remote.content);
-      } finally {
-        this.applyingRemote = false;
+    if (localMtime >= remote.mtime) {
+      // Local is newer (or equal mtime) - push local content over remote
+      const doc: CouchDoc = {
+        _id: path,
+        _rev: remote._rev,
+        content: localContent,
+        mtime: localMtime,
+      };
+      const result = await this.client.put(doc);
+      if (result.ok && result.rev) {
+        this.revMap[path] = result.rev;
+      }
+    } else {
+      // Remote is newer - apply remote content locally
+      const normalized = normalizePath(path);
+      const existing = this.vault.getAbstractFileByPath(normalized);
+      if (existing instanceof TFile) {
+        this.applyingRemote = true;
+        try {
+          await this.vault.modify(existing, remote.content);
+        } finally {
+          this.applyingRemote = false;
+        }
       }
     }
 
     this.persistState();
-    this.onError(
-      `Conflict on ${path}: your version saved as ${conflictFile.split("/").pop()}`
-    );
   }
 
   // --- Counts ---
@@ -497,7 +499,6 @@ export class SyncEngine {
     this.onCountsChange({
       pendingPush: this.pendingWrites.size,
       pendingPull: this.pullCount,
-      conflicts: this.conflictCount,
     });
   }
 
@@ -505,16 +506,5 @@ export class SyncEngine {
 
   private isExcluded(path: string): boolean {
     return this.settings.excludePatterns.some((pattern) => path.startsWith(pattern));
-  }
-
-  /**
-   * Generate a conflict file path: note.sync-conflict-20260318-143022.md
-   */
-  private conflictPath(originalPath: string): string {
-    const now = new Date();
-    const ts = now.toISOString().replace(/[-:T]/g, "").slice(0, 15);
-    const dot = originalPath.lastIndexOf(".");
-    if (dot === -1) return `${originalPath}.sync-conflict-${ts}`;
-    return `${originalPath.slice(0, dot)}.sync-conflict-${ts}${originalPath.slice(dot)}`;
   }
 }

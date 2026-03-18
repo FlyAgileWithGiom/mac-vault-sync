@@ -18,7 +18,7 @@ export default class VaultSyncPlugin extends Plugin {
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
-  private syncCounts: SyncCounts = { pendingPush: 0, pendingPull: 0, conflicts: 0 };
+  private syncCounts: SyncCounts = { pendingPush: 0, pendingPull: 0 };
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -183,7 +183,7 @@ export default class VaultSyncPlugin extends Plugin {
     if (!this.statusBarEl) return;
 
     const label = VaultSyncPlugin.STATUS_LABELS[this.syncState];
-    const { pendingPush, pendingPull, conflicts } = this.syncCounts;
+    const { pendingPush, pendingPull } = this.syncCounts;
     const parts: string[] = [label];
 
     if (pendingPush > 0 || pendingPull > 0) {
@@ -193,12 +193,8 @@ export default class VaultSyncPlugin extends Plugin {
       parts.push(counts.join(" "));
     }
 
-    if (conflicts > 0) {
-      parts.push(`\u26A0${conflicts}`);
-    }
-
     this.statusBarEl.setText(parts.join(" "));
-    this.statusBarEl.dataset.state = conflicts > 0 ? "conflict" : this.syncState;
+    this.statusBarEl.dataset.state = this.syncState;
   }
 
   private handleSyncError(msg: string): void {
