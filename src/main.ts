@@ -2,7 +2,7 @@ import { Notice, Plugin } from "obsidian";
 import { CouchClient } from "./couch-client";
 import { SyncEngine } from "./sync-engine";
 import { VaultSyncSettingTab } from "./settings-tab";
-import type { VaultSyncSettings, SyncState } from "./types";
+import type { VaultSyncSettings, SyncState, SyncCounts } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 
 /**
@@ -16,20 +16,28 @@ export default class VaultSyncPlugin extends Plugin {
   settings: VaultSyncSettings = { ...DEFAULT_SETTINGS };
   private syncEngine!: SyncEngine;
   private ribbonEl: HTMLElement | null = null;
+  private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
+  private syncCounts: SyncCounts = { pendingPush: 0, pendingPull: 0 };
 
   async onload(): Promise<void> {
     await this.loadSettings();
 
     this.syncEngine = new SyncEngine(this.settings, this.app.vault);
     this.syncEngine.onStateChange = (state) => this.updateState(state);
+    this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
     this.syncEngine.onError = (msg) => this.handleSyncError(msg);
 
-    // Ribbon icon for sync status
+    // Ribbon icon for sync toggle
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Vault Sync", () => {
       this.toggleSync();
     });
     this.updateRibbonState();
+
+    // Status bar indicator (bottom bar, non-intrusive)
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("vault-sync-statusbar");
+    this.updateStatusBar();
 
     // Settings tab
     this.addSettingTab(new VaultSyncSettingTab(this.app, this));
@@ -143,6 +151,7 @@ export default class VaultSyncPlugin extends Plugin {
   private updateState(state: SyncState): void {
     this.syncState = state;
     this.updateRibbonState();
+    this.updateStatusBar();
   }
 
   private updateRibbonState(): void {
@@ -154,6 +163,38 @@ export default class VaultSyncPlugin extends Plugin {
       .replace(/vault-sync-ribbon/g, "")
       .trim();
     this.ribbonEl.addClass("vault-sync-ribbon");
+  }
+
+  private static readonly STATUS_LABELS: Record<SyncState, string> = {
+    "idle": "\u25CB Sync off",
+    "syncing": "\u25D4 Syncing\u2026",
+    "ok": "\u25CF Synced",
+    "error": "\u25CF Sync error",
+    "offline": "\u25CB Offline",
+    "not-configured": "\u25CB Not configured",
+  };
+
+  private updateCounts(counts: SyncCounts): void {
+    this.syncCounts = counts;
+    this.updateStatusBar();
+  }
+
+  private updateStatusBar(): void {
+    if (!this.statusBarEl) return;
+
+    const label = VaultSyncPlugin.STATUS_LABELS[this.syncState];
+    const { pendingPush, pendingPull } = this.syncCounts;
+    const parts: string[] = [label];
+
+    if (pendingPush > 0 || pendingPull > 0) {
+      const counts: string[] = [];
+      if (pendingPush > 0) counts.push(`\u2191${pendingPush}`);
+      if (pendingPull > 0) counts.push(`\u2193${pendingPull}`);
+      parts.push(counts.join(" "));
+    }
+
+    this.statusBarEl.setText(parts.join(" "));
+    this.statusBarEl.dataset.state = this.syncState;
   }
 
   private handleSyncError(msg: string): void {

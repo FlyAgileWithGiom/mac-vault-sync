@@ -458,6 +458,121 @@ describe("SyncEngine", () => {
     });
   });
 
+  describe("conflict resolution (last-write-wins)", () => {
+    it("pushes local version when local mtime is newer", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      await engine.start();
+
+      // Simulate a file that already has a rev (was synced before)
+      const file = vault._addFile("notes/conflict.md", "local version", 3000);
+      // First put fails with 409 (stale rev)
+      const { CouchError } = await import("./couch-client");
+      client.put
+        .mockRejectedValueOnce(new CouchError(409, "conflict"))
+        .mockResolvedValueOnce({ ok: true, id: "notes/conflict.md", rev: "3-winner" });
+      // get() returns remote with older mtime
+      client.get.mockResolvedValue({
+        _id: "notes/conflict.md",
+        _rev: "2-remote",
+        content: "remote version",
+        mtime: 2000,
+      });
+
+      engine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Should have re-pushed local content with remote's _rev
+      expect(client.put).toHaveBeenCalledWith(
+        expect.objectContaining({
+          _id: "notes/conflict.md",
+          _rev: "2-remote",
+          content: "local version",
+          mtime: 3000,
+        })
+      );
+    });
+
+    it("applies remote version when remote mtime is newer", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      await engine.start();
+
+      const file = vault._addFile("notes/conflict.md", "old local", 1000);
+      const { CouchError } = await import("./couch-client");
+      client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
+      // Remote is newer
+      client.get.mockResolvedValue({
+        _id: "notes/conflict.md",
+        _rev: "2-remote",
+        content: "newer remote",
+        mtime: 5000,
+      });
+
+      engine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Should have applied remote content to vault
+      expect(vault._getContent("notes/conflict.md")).toBe("newer remote");
+    });
+
+    it("does not create conflict files", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      await engine.start();
+
+      const file = vault._addFile("notes/conflict.md", "local", 1000);
+      const { CouchError } = await import("./couch-client");
+      client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
+      client.get.mockResolvedValue({
+        _id: "notes/conflict.md",
+        _rev: "2-remote",
+        content: "remote",
+        mtime: 5000,
+      });
+
+      engine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Verify no .sync-conflict file was created
+      const allFiles = vault.getFiles();
+      const conflictFiles = allFiles.filter((f: any) => f.path.includes("sync-conflict"));
+      expect(conflictFiles).toHaveLength(0);
+    });
+
+    it("skips re-push when content is identical", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      await engine.start();
+
+      const file = vault._addFile("notes/same.md", "same content", 2000);
+      const { CouchError } = await import("./couch-client");
+      client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
+      // Remote has identical content
+      client.get.mockResolvedValue({
+        _id: "notes/same.md",
+        _rev: "2-remote",
+        content: "same content",
+        mtime: 1000,
+      });
+
+      engine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // put should have been called only once (the initial failed attempt)
+      // The conflict resolution should NOT push again since content is identical
+      expect(client.put).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("updateSettings", () => {
     it("propagates new settings to CouchClient", () => {
       const client = getClient(engine);

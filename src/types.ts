@@ -8,8 +8,8 @@ export interface VaultSyncSettings {
 }
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
-  couchDbUrl: "",
-  couchDbName: "",
+  couchDbUrl: "https://mcp.fly-agile.com:5984",
+  couchDbName: "obsidian",
   couchDbUser: "",
   couchDbPassword: "",
   syncDebounceMs: 500,
@@ -17,6 +17,11 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 };
 
 export type SyncState = "idle" | "syncing" | "ok" | "error" | "offline" | "not-configured";
+
+export interface SyncCounts {
+  pendingPush: number;
+  pendingPull: number;
+}
 
 /** Tracks known revision for each doc to detect remote changes */
 export interface RevMap {

@@ -1,11 +1,12 @@
 import { TFile, TAbstractFile, Vault, normalizePath } from "obsidian";
-import { CouchClient } from "./couch-client";
+import { CouchClient, CouchError } from "./couch-client";
 import type {
   VaultSyncSettings,
   CouchDoc,
   CouchChangeRow,
   RevMap,
   SyncState,
+  SyncCounts,
 } from "./types";
 
 const REVMAP_KEY = "vault-sync-revmap";
@@ -29,9 +30,11 @@ export class SyncEngine {
   private pendingWrites: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private applyingRemote = false;
   private running = false;
+  private pullCount = 0;
 
   /** Callback to update UI state */
   onStateChange: (state: SyncState) => void = () => {};
+  onCountsChange: (counts: SyncCounts) => void = () => {};
   onError: (msg: string) => void = () => {};
 
   constructor(
@@ -176,8 +179,11 @@ export class SyncEngine {
         if (result.ok && result.rev) {
           this.revMap[result.id] = result.rev;
         } else if (result.error === "conflict") {
-          // Conflict: remote was updated since we checked. Pull wins.
-          // Will be resolved on next pull.
+          // Conflict during bulk push: resolve individually
+          const localDoc = chunk.find((d) => d._id === result.id);
+          if (localDoc) {
+            await this.resolveConflict(result.id, localDoc.content, localDoc.mtime);
+          }
         }
       }
     }
@@ -257,6 +263,8 @@ export class SyncEngine {
 
   private async applyRemoteChanges(changes: CouchChangeRow[]): Promise<void> {
     this.applyingRemote = true;
+    this.pullCount = changes.filter((c) => !c.id.startsWith("_design/")).length;
+    this.emitCounts();
     try {
       for (const change of changes) {
         if (change.id.startsWith("_design/")) continue;
@@ -271,9 +279,13 @@ export class SyncEngine {
         if (change.changes.length > 0) {
           this.revMap[change.id] = change.changes[0].rev;
         }
+        this.pullCount--;
+        this.emitCounts();
       }
     } finally {
+      this.pullCount = 0;
       this.applyingRemote = false;
+      this.emitCounts();
     }
   }
 
@@ -340,10 +352,12 @@ export class SyncEngine {
 
     const timer = setTimeout(async () => {
       this.pendingWrites.delete(file.path);
+      this.emitCounts();
       await this.pushFile(file);
     }, this.settings.syncDebounceMs);
 
     this.pendingWrites.set(file.path, timer);
+    this.emitCounts();
   }
 
   /** Called when a local file is deleted */
@@ -413,14 +427,79 @@ export class SyncEngine {
         }
       }
 
-      const result = await this.client.put(doc);
-      if (result.ok && result.rev) {
-        this.revMap[file.path] = result.rev;
-        this.persistState();
+      try {
+        const result = await this.client.put(doc);
+        if (result.ok && result.rev) {
+          this.revMap[file.path] = result.rev;
+          this.persistState();
+        }
+      } catch (e) {
+        if (e instanceof CouchError && e.status === 409) {
+          await this.resolveConflict(file.path, content, file.stat.mtime);
+        } else {
+          throw e;
+        }
       }
     } catch (e) {
       this.onError(`Push failed for ${file.path}: ${(e as Error).message}`);
     }
+  }
+
+  /**
+   * Resolve a push conflict using last-write-wins by mtime.
+   * Fetches the remote version, compares mtime, and the newest version wins.
+   * No conflict files are created - resolution is fully automatic.
+   */
+  private async resolveConflict(
+    path: string,
+    localContent: string,
+    localMtime: number,
+  ): Promise<void> {
+    const remote = await this.client.get(path);
+    this.revMap[path] = remote._rev!;
+
+    if (remote.content === localContent) {
+      // Same content, no real conflict - just update rev
+      this.persistState();
+      return;
+    }
+
+    if (localMtime >= remote.mtime) {
+      // Local is newer (or equal mtime) - push local content over remote
+      const doc: CouchDoc = {
+        _id: path,
+        _rev: remote._rev,
+        content: localContent,
+        mtime: localMtime,
+      };
+      const result = await this.client.put(doc);
+      if (result.ok && result.rev) {
+        this.revMap[path] = result.rev;
+      }
+    } else {
+      // Remote is newer - apply remote content locally
+      const normalized = normalizePath(path);
+      const existing = this.vault.getAbstractFileByPath(normalized);
+      if (existing instanceof TFile) {
+        this.applyingRemote = true;
+        try {
+          await this.vault.modify(existing, remote.content);
+        } finally {
+          this.applyingRemote = false;
+        }
+      }
+    }
+
+    this.persistState();
+  }
+
+  // --- Counts ---
+
+  private emitCounts(): void {
+    this.onCountsChange({
+      pendingPush: this.pendingWrites.size,
+      pendingPull: this.pullCount,
+    });
   }
 
   // --- Utilities ---

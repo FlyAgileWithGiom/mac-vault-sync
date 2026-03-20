@@ -4,3 +4,12 @@
 .vault-sync-ribbon[data-state="offline"] .svg-icon { opacity: 0.4; }
 
 @keyframes vault-sync-spin { to { transform: rotate(360deg); } }
+
+/* Status bar indicator */
+.vault-sync-statusbar { font-size: var(--font-smallest); opacity: 0.8; }
+.vault-sync-statusbar[data-state="ok"] { color: var(--color-green); }
+.vault-sync-statusbar[data-state="error"] { color: var(--color-red); }
+.vault-sync-statusbar[data-state="syncing"] { color: var(--color-yellow); }
+.vault-sync-statusbar[data-state="offline"] { opacity: 0.4; }
+.vault-sync-statusbar[data-state="idle"] { opacity: 0.5; }
+.vault-sync-statusbar[data-state="not-configured"] { opacity: 0.3; }
