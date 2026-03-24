@@ -131,19 +131,18 @@ export class SyncEngine {
   async fullSync(): Promise<void> {
     this.onStateChange("syncing");
     try {
-      // Fetch all remote docs once, reuse for both push and pull
-      const remoteResult = await this.client.allDocs({
+      // Fetch remote rev index (no content) -- lightweight, ~15K rows with just id+rev
+      const remoteIndex = await this.client.allDocs({
         startkey: DOC_PREFIX,
         endkey: `${DOC_PREFIX}\uffff`,
-        include_docs: true,
       });
-      const remoteMap = new Map<string, CouchDoc>();
-      for (const row of remoteResult.rows) {
-        if (row.doc) remoteMap.set(row.id, row.doc);
+      const remoteRevs = new Map<string, string>();
+      for (const row of remoteIndex.rows) {
+        remoteRevs.set(row.id, row.value.rev);
       }
 
-      await this.pushAllLocal(remoteMap);
-      await this.pullAllRemote(remoteMap);
+      await this.pushAllLocal(remoteRevs);
+      await this.pullAllRemote(remoteRevs);
       this.persistState();
       this.onStateChange("ok");
     } catch (e) {
@@ -153,27 +152,32 @@ export class SyncEngine {
   }
 
   /**
-   * Push all local vault files to CouchDB.
-   * Uses pre-fetched remote map to avoid N+1 GETs.
+   * Push local files that are new or changed since last sync.
+   * Uses rev index (no content) to determine what needs pushing.
    */
-  private async pushAllLocal(remoteMap: Map<string, CouchDoc>): Promise<void> {
+  private async pushAllLocal(remoteRevs: Map<string, string>): Promise<void> {
     const files = this.vault.getFiles().filter((f) => !this.isExcluded(f.path));
 
     const batch: CouchDoc[] = [];
 
     for (const file of files) {
       const docId = pathToDocId(file.path);
-      const mtime = file.stat.mtime;
-      const remote = remoteMap.get(docId);
+      const remoteRev = remoteRevs.get(docId);
+      const knownRev = this.revMap[docId];
 
-      if (remote) {
-        this.revMap[docId] = remote._rev!;
-        if (remote.mtime >= mtime) continue; // Remote is same or newer, skip
+      if (remoteRev) {
+        // Doc exists remotely - skip if rev unchanged since last sync
+        if (knownRev === remoteRev) continue;
+        // Rev changed by another device - let pull handle it
+        if (knownRev && knownRev !== remoteRev) continue;
+        // First sync (no knownRev) - push local with remote rev
+        this.revMap[docId] = remoteRev;
         const content = await this.vault.cachedRead(file);
-        batch.push({ _id: docId, _rev: remote._rev, content, mtime });
+        batch.push({ _id: docId, _rev: remoteRev, content, mtime: file.stat.mtime });
       } else {
+        // New file, not on remote
         const content = await this.vault.cachedRead(file);
-        batch.push({ _id: docId, content, mtime });
+        batch.push({ _id: docId, content, mtime: file.stat.mtime });
       }
     }
 
@@ -198,21 +202,46 @@ export class SyncEngine {
   }
 
   /**
-   * Pull all remote docs and apply to vault.
-   * Uses pre-fetched remote map to avoid a second _all_docs call.
+   * Pull remote docs that are new or changed since last sync.
+   * Only fetches content for docs whose rev differs from local revMap.
    */
-  private async pullAllRemote(remoteMap: Map<string, CouchDoc>): Promise<void> {
-    this.applyingRemote = true;
-    try {
-      for (const [docId, doc] of remoteMap) {
-        if (docId.startsWith("_design/")) continue;
-        await this.applyRemoteDoc(doc);
-        if (doc._rev) {
-          this.revMap[docId] = doc._rev;
+  private async pullAllRemote(remoteRevs: Map<string, string>): Promise<void> {
+    // Find docs that need pulling (rev differs or unknown locally)
+    const toPull: string[] = [];
+    for (const [docId, rev] of remoteRevs) {
+      if (docId.startsWith("_design/")) continue;
+      if (this.revMap[docId] === rev) continue;
+      toPull.push(docId);
+    }
+
+    if (toPull.length > 0) {
+      this.applyingRemote = true;
+      this.pullCount = toPull.length;
+      this.emitCounts();
+      try {
+        // Fetch changed docs in batches
+        const BATCH = 50;
+        for (let i = 0; i < toPull.length; i += BATCH) {
+          const batchIds = toPull.slice(i, i + BATCH);
+          for (const docId of batchIds) {
+            try {
+              const doc = await this.client.get(docId);
+              await this.applyRemoteDoc(doc);
+              if (doc._rev) {
+                this.revMap[docId] = doc._rev;
+              }
+            } catch {
+              // Skip docs that fail to fetch
+            }
+            this.pullCount--;
+            this.emitCounts();
+          }
         }
+      } finally {
+        this.pullCount = 0;
+        this.applyingRemote = false;
+        this.emitCounts();
       }
-    } finally {
-      this.applyingRemote = false;
     }
 
     // Get current sequence for changes feed

@@ -175,26 +175,32 @@ describe("SyncEngine", () => {
       }
     });
 
-    it("skips push when remote has newer mtime", async () => {
+    it("skips push when rev is already known (synced before)", async () => {
       vault._addFile("notes/old.md", "local content", 1000);
 
-      const client = getClient(engine);
-      // allDocs returns remote doc with newer mtime
-      client.allDocs.mockResolvedValue({
+      // Pre-populate revMap to simulate a previous sync
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/old.md": "1-r" });
+      const engine2 = new SyncEngine(settings, vault as any);
+      engine2.onStateChange = (state) => stateChanges.push(state);
+      engine2.onError = (msg) => errors.push(msg);
+
+      const client2 = getClient(engine2);
+      // allDocs returns same rev as in revMap
+      client2.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
           id: "file/notes/old.md",
           key: "file/notes/old.md",
           value: { rev: "1-r" },
-          doc: { _id: "file/notes/old.md", _rev: "1-r", content: "remote", mtime: 2000 },
         }],
       });
-      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      client2.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
-      // bulkDocs should not be called (nothing to push)
-      expect(client.bulkDocs).not.toHaveBeenCalled();
+      // bulkDocs should not be called (rev unchanged)
+      expect(client2.bulkDocs).not.toHaveBeenCalled();
+      engine2.stop();
     });
 
     it("includes _rev when updating existing remote doc", async () => {
@@ -227,16 +233,17 @@ describe("SyncEngine", () => {
   describe("fullSync - pull", () => {
     it("creates local files from remote docs", async () => {
       const client = getClient(engine);
-      client.get.mockRejectedValue(new Error("not found")); // No local files to push
+      // allDocs returns rev index (no content)
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
           id: "file/notes/remote.md",
           key: "file/notes/remote.md",
           value: { rev: "1-r" },
-          doc: { _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 },
         }],
       });
+      // get() returns full doc when pulled
+      client.get.mockResolvedValue({ _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
@@ -247,23 +254,29 @@ describe("SyncEngine", () => {
     it("overwrites local file when remote is newer", async () => {
       vault._addFile("notes/shared.md", "old local", 1000);
 
-      const client = getClient(engine);
-      client.get.mockResolvedValue({ _id: "file/notes/shared.md", _rev: "1-r", content: "old remote", mtime: 2000 });
-      // Remote is even newer during pull
+      // Pre-populate revMap so push is skipped (rev matches)
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/shared.md": "1-r" });
+      const engine2 = new SyncEngine(settings, vault as any);
+      engine2.onStateChange = (state) => stateChanges.push(state);
+      engine2.onError = (msg) => errors.push(msg);
+
+      const client = getClient(engine2);
+      // allDocs returns newer rev (2-r vs 1-r in revMap) -> triggers pull
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
           id: "file/notes/shared.md",
           key: "file/notes/shared.md",
           value: { rev: "2-r" },
-          doc: { _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 },
         }],
       });
+      client.get.mockResolvedValue({ _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 });
       client.changes.mockResolvedValue({ last_seq: "2", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
       expect(vault._getContent("notes/shared.md")).toBe("newer remote");
+      engine2.stop();
     });
 
     it("skips _design/ docs during pull", async () => {
