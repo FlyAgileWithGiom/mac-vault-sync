@@ -115,6 +115,9 @@ export default class VaultSyncPlugin extends Plugin {
       delete data.password;
       delete data.debounceMs;
       delete data.maxBinarySize;
+      this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+      await this.saveData(this.settings);
+      return;
     }
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
