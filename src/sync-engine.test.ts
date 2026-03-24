@@ -237,15 +237,7 @@ describe("SyncEngine", () => {
           value: { rev: "1-r" },
         }],
       });
-      client.allDocsByKeys.mockResolvedValue({
-        total_rows: 1,
-        rows: [{
-          id: "file/notes/remote.md",
-          key: "file/notes/remote.md",
-          value: { rev: "1-r" },
-          doc: { _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 },
-        }],
-      });
+      client.get.mockResolvedValue({ _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
@@ -272,15 +264,7 @@ describe("SyncEngine", () => {
           value: { rev: "2-r" },
         }],
       });
-      client.allDocsByKeys.mockResolvedValue({
-        total_rows: 1,
-        rows: [{
-          id: "file/notes/shared.md",
-          key: "file/notes/shared.md",
-          value: { rev: "2-r" },
-          doc: { _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 },
-        }],
-      });
+      client.get.mockResolvedValue({ _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 });
       client.changes.mockResolvedValue({ last_seq: "2", results: [] });
 
       await engine2.start();
