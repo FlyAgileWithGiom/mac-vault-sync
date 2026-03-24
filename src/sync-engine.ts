@@ -12,6 +12,7 @@ import type {
 const REVMAP_KEY = "vault-sync-revmap";
 const SEQ_KEY = "vault-sync-last-seq";
 const DOC_PREFIX = "file/";
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 
 /** Convert a vault file path to a CouchDB doc ID */
 function pathToDocId(path: string): string {
@@ -162,7 +163,7 @@ export class SyncEngine {
    * Uses rev index (no content) to determine what needs pushing.
    */
   private async pushAllLocal(remoteRevs: Map<string, string>): Promise<void> {
-    const files = this.vault.getFiles().filter((f) => !this.isExcluded(f.path));
+    const files = this.vault.getFiles().filter((f) => !this.isExcluded(f.path) && f.stat.size <= MAX_FILE_SIZE);
 
     const batch: CouchDoc[] = [];
 
@@ -189,8 +190,8 @@ export class SyncEngine {
         const content = await this.vault.cachedRead(file);
         batch.push({ _id: docId, content, mtime: file.stat.mtime });
 
-        // Flush in chunks to limit memory usage
-        if (batch.length >= 50) {
+        // Flush in small chunks to avoid nginx 413
+        if (batch.length >= 10) {
           await this.pushBatch(batch.splice(0));
           await this.yield();
         }
@@ -203,14 +204,33 @@ export class SyncEngine {
   }
 
   private async pushBatch(batch: CouchDoc[]): Promise<void> {
-    const results = await this.client.bulkDocs(batch);
-    for (const result of results) {
-      if (result.ok && result.rev) {
-        this.revMap[result.id] = result.rev;
-      } else if (result.error === "conflict") {
-        const localDoc = batch.find((d) => d._id === result.id);
-        if (localDoc) {
-          await this.resolveConflict(result.id, localDoc.content, localDoc.mtime);
+    try {
+      const results = await this.client.bulkDocs(batch);
+      for (const result of results) {
+        if (result.ok && result.rev) {
+          this.revMap[result.id] = result.rev;
+        } else if (result.error === "conflict") {
+          const localDoc = batch.find((d) => d._id === result.id);
+          if (localDoc) {
+            await this.resolveConflict(result.id, localDoc.content, localDoc.mtime);
+          }
+        }
+      }
+    } catch (e) {
+      // 413 or other bulk error: fall back to individual puts
+      console.log(`[vault-sync] Bulk push failed (${(e as Error).message}), falling back to individual puts`);
+      for (const doc of batch) {
+        try {
+          const result = await this.client.put(doc);
+          if (result.ok && result.rev) {
+            this.revMap[result.id] = result.rev;
+          }
+        } catch (putErr) {
+          if (putErr instanceof CouchError && putErr.status === 409) {
+            await this.resolveConflict(doc._id, doc.content, doc.mtime);
+          } else {
+            this.onError(`Push failed for ${doc._id}: ${(putErr as Error).message}`);
+          }
         }
       }
     }
@@ -425,6 +445,7 @@ export class SyncEngine {
     if (!this.running || this.applyingRemote) return;
     if (!(file instanceof TFile)) return;
     if (this.isExcluded(file.path)) return;
+    if (file.stat.size > MAX_FILE_SIZE) return; // TODO: chunk large files
     console.log(`[vault-sync] Local change: ${file.path}`);
 
     // Cancel any pending debounce for this file
