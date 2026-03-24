@@ -203,30 +203,25 @@ describe("SyncEngine", () => {
       engine2.stop();
     });
 
-    it("includes _rev when updating existing remote doc", async () => {
+    it("trusts remote on first sync and does not re-push existing docs", async () => {
       vault._addFile("notes/newer.md", "updated", 3000);
 
       const client = getClient(engine);
-      // allDocs returns remote doc with older mtime
+      // Doc exists on remote - first sync should trust it, not re-push
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
           id: "file/notes/newer.md",
           key: "file/notes/newer.md",
           value: { rev: "1-old" },
-          doc: { _id: "file/notes/newer.md", _rev: "1-old", content: "old", mtime: 1000 },
         }],
       });
-      client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/newer.md", rev: "2-new" }]);
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
 
-      expect(client.bulkDocs).toHaveBeenCalledWith(
-        expect.arrayContaining([
-          expect.objectContaining({ _id: "file/notes/newer.md", _rev: "1-old" }),
-        ])
-      );
+      // Should not push (doc already exists remotely)
+      expect(client.bulkDocs).not.toHaveBeenCalled();
     });
   });
 

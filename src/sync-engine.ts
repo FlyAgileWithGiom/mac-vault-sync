@@ -170,36 +170,42 @@ export class SyncEngine {
       if (fi % 100 === 99) await this.yield();
 
       if (remoteRev) {
-        // Doc exists remotely - skip if rev unchanged since last sync
-        if (knownRev === remoteRev) continue;
+        // Doc exists remotely
+        if (!knownRev) {
+          // First sync for this doc - trust remote, just record rev
+          this.revMap[docId] = remoteRev;
+          continue;
+        }
+        if (knownRev === remoteRev) continue; // Unchanged
         // Rev changed by another device - let pull handle it
-        if (knownRev && knownRev !== remoteRev) continue;
-        // First sync (no knownRev) - push local with remote rev
-        this.revMap[docId] = remoteRev;
-        const content = await this.vault.cachedRead(file);
-        batch.push({ _id: docId, _rev: remoteRev, content, mtime: file.stat.mtime });
+        continue;
       } else {
         // New file, not on remote
         const content = await this.vault.cachedRead(file);
         batch.push({ _id: docId, content, mtime: file.stat.mtime });
+
+        // Flush in chunks to limit memory usage
+        if (batch.length >= 50) {
+          await this.pushBatch(batch.splice(0));
+          await this.yield();
+        }
       }
     }
 
-    if (batch.length === 0) return;
+    if (batch.length > 0) {
+      await this.pushBatch(batch);
+    }
+  }
 
-    // Bulk push in chunks to avoid oversized requests
-    const CHUNK_SIZE = 50;
-    for (let i = 0; i < batch.length; i += CHUNK_SIZE) {
-      const chunk = batch.slice(i, i + CHUNK_SIZE);
-      const results = await this.client.bulkDocs(chunk);
-      for (const result of results) {
-        if (result.ok && result.rev) {
-          this.revMap[result.id] = result.rev;
-        } else if (result.error === "conflict") {
-          const localDoc = chunk.find((d) => d._id === result.id);
-          if (localDoc) {
-            await this.resolveConflict(result.id, localDoc.content, localDoc.mtime);
-          }
+  private async pushBatch(batch: CouchDoc[]): Promise<void> {
+    const results = await this.client.bulkDocs(batch);
+    for (const result of results) {
+      if (result.ok && result.rev) {
+        this.revMap[result.id] = result.rev;
+      } else if (result.error === "conflict") {
+        const localDoc = batch.find((d) => d._id === result.id);
+        if (localDoc) {
+          await this.resolveConflict(result.id, localDoc.content, localDoc.mtime);
         }
       }
     }
