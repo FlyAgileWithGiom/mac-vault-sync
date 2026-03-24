@@ -13,3 +13,10 @@
 .vault-sync-statusbar[data-state="offline"] { opacity: 0.4; }
 .vault-sync-statusbar[data-state="idle"] { opacity: 0.5; }
 .vault-sync-statusbar[data-state="not-configured"] { opacity: 0.3; }
+
+/* Diagnostics table in settings */
+.vault-sync-diagnostics { margin-top: 0.5em; }
+.vault-sync-diag-table { width: 100%; border-collapse: collapse; font-size: var(--font-small); }
+.vault-sync-diag-table td { padding: 4px 8px; border-bottom: 1px solid var(--background-modifier-border); }
+.vault-sync-diag-label { font-weight: 600; white-space: nowrap; width: 1%; }
+.vault-sync-diag-value { font-family: var(--font-monospace); }

@@ -2,7 +2,7 @@ import { Notice, Plugin } from "obsidian";
 import { CouchClient } from "./couch-client";
 import { SyncEngine } from "./sync-engine";
 import { VaultSyncSettingTab } from "./settings-tab";
-import type { VaultSyncSettings, SyncState, SyncCounts } from "./types";
+import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 
 /**
@@ -19,6 +19,7 @@ export default class VaultSyncPlugin extends Plugin {
   private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
   private syncCounts: SyncCounts = { pendingPush: 0, pendingPull: 0 };
+  private diagnosticsListeners: Set<() => void> = new Set();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -27,6 +28,7 @@ export default class VaultSyncPlugin extends Plugin {
     this.syncEngine.onStateChange = (state) => this.updateState(state);
     this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
     this.syncEngine.onError = (msg) => this.handleSyncError(msg);
+    this.syncEngine.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
 
     // Ribbon icon for sync toggle
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Vault Sync", () => {
@@ -154,6 +156,25 @@ export default class VaultSyncPlugin extends Plugin {
       await this.startSync();
     }
     await this.syncEngine.forceFullSync();
+  }
+
+  /** Public: diagnostics for settings tab observability on mobile */
+  getDiagnostics(): SyncDiagnostics {
+    return this.syncEngine.getDiagnostics();
+  }
+
+  subscribeDiagnostics(listener: () => void): void {
+    this.diagnosticsListeners.add(listener);
+  }
+
+  unsubscribeDiagnostics(listener: () => void): void {
+    this.diagnosticsListeners.delete(listener);
+  }
+
+  private notifyDiagnosticsListeners(): void {
+    for (const listener of this.diagnosticsListeners) {
+      listener();
+    }
   }
 
   /** Public: called from settings tab */

@@ -64,5 +64,17 @@ export interface CouchAllDocsResult {
     key: string;
     value: { rev: string };
     doc?: CouchDoc;
+    error?: string; // Present when doc not found (POST _all_docs with keys)
   }[];
+}
+
+/** Diagnostic snapshot for settings UI -- provides observability on mobile */
+export interface SyncDiagnostics {
+  running: boolean;
+  state: SyncState;
+  revMapSize: number;
+  lastSeq: string | number;
+  pullProgress: { fetched: number; total: number } | null;
+  pendingPushCount: number;
+  lastError: string | null;
 }
