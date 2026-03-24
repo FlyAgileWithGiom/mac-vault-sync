@@ -117,6 +117,20 @@ export class CouchClient {
     return this.request<CouchAllDocsResult>(`/_all_docs${qs ? "?" + qs : ""}`);
   }
 
+  /**
+   * Fetch specific docs by keys using POST _all_docs (avoids N+1 individual GETs).
+   * CouchDB supports POST with {"keys": [...]} body for batch retrieval.
+   */
+  async allDocsByKeys(keys: string[]): Promise<CouchAllDocsResult> {
+    return this.request<CouchAllDocsResult>(
+      "/_all_docs?include_docs=true",
+      {
+        method: "POST",
+        body: JSON.stringify({ keys }),
+      }
+    );
+  }
+
   async bulkDocs(docs: CouchDoc[]): Promise<CouchBulkResult[]> {
     return this.request<CouchBulkResult[]>("/_bulk_docs", {
       method: "POST",

@@ -14,6 +14,7 @@ vi.mock("./couch-client", () => {
       put: vi.fn(),
       delete: vi.fn(),
       allDocs: vi.fn().mockResolvedValue({ total_rows: 0, rows: [] }),
+      allDocsByKeys: vi.fn().mockResolvedValue({ total_rows: 0, rows: [] }),
       bulkDocs: vi.fn().mockResolvedValue([]),
       changes: vi.fn().mockResolvedValue({ last_seq: "0", results: [] }),
       cancelChanges: vi.fn(),
@@ -236,7 +237,15 @@ describe("SyncEngine", () => {
           value: { rev: "1-r" },
         }],
       });
-      client.get.mockResolvedValue({ _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/remote.md",
+          key: "file/notes/remote.md",
+          value: { rev: "1-r" },
+          doc: { _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 },
+        }],
+      });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
@@ -263,7 +272,15 @@ describe("SyncEngine", () => {
           value: { rev: "2-r" },
         }],
       });
-      client.get.mockResolvedValue({ _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/shared.md",
+          key: "file/notes/shared.md",
+          value: { rev: "2-r" },
+          doc: { _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 },
+        }],
+      });
       client.changes.mockResolvedValue({ last_seq: "2", results: [] });
 
       await engine2.start();

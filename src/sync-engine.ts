@@ -7,12 +7,14 @@ import type {
   RevMap,
   SyncState,
   SyncCounts,
+  SyncDiagnostics,
 } from "./types";
 
 const REVMAP_KEY = "vault-sync-revmap";
 const SEQ_KEY = "vault-sync-last-seq";
 const DOC_PREFIX = "file/";
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
+const PULL_BATCH_SIZE = 50; // Docs per _all_docs batch during pull (balances response size vs request count)
 
 /** Convert a vault file path to a CouchDB doc ID */
 function pathToDocId(path: string): string {
@@ -44,11 +46,17 @@ export class SyncEngine {
   private recentRemotePaths: Set<string> = new Set();
   private running = false;
   private pullCount = 0;
+  private pullTotal = 0;
+  private pullFetched = 0;
+  private lastError: string | null = null;
+  private currentState: SyncState = "idle";
 
   /** Callback to update UI state */
   onStateChange: (state: SyncState) => void = () => {};
   onCountsChange: (counts: SyncCounts) => void = () => {};
   onError: (msg: string) => void = () => {};
+  /** Callback for diagnostics refresh (settings tab live update) */
+  onDiagnosticsChange: () => void = () => {};
 
   constructor(
     private settings: VaultSyncSettings,
@@ -66,6 +74,32 @@ export class SyncEngine {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  getDiagnostics(): SyncDiagnostics {
+    return {
+      running: this.running,
+      state: this.currentState,
+      revMapSize: Object.keys(this.revMap).length,
+      lastSeq: this.lastSeq,
+      pullProgress: this.pullTotal > 0
+        ? { fetched: this.pullFetched, total: this.pullTotal }
+        : null,
+      pendingPushCount: this.pendingWrites.size,
+      lastError: this.lastError,
+    };
+  }
+
+  private setState(state: SyncState): void {
+    this.currentState = state;
+    this.onStateChange(state);
+    this.onDiagnosticsChange();
+  }
+
+  private setError(msg: string): void {
+    this.lastError = msg;
+    this.onError(msg);
+    this.onDiagnosticsChange();
   }
 
   // --- Persistence (survives plugin reloads) ---
@@ -97,11 +131,11 @@ export class SyncEngine {
   async start(): Promise<void> {
     if (!this.client.isConfigured()) {
       console.log("[vault-sync] Not configured, skipping start");
-      this.onStateChange("not-configured");
+      this.setState("not-configured");
       return;
     }
     this.running = true;
-    this.onStateChange("syncing");
+    this.setState("syncing");
     console.log("[vault-sync] Starting sync...");
 
     try {
@@ -109,13 +143,13 @@ export class SyncEngine {
       console.log("[vault-sync] DB ensured, starting fullSync");
       await this.fullSync();
       console.log("[vault-sync] fullSync complete, starting polling");
-      this.onStateChange("ok");
+      this.setState("ok");
       this.startPolling();
     } catch (e) {
       this.running = false;
-      this.onStateChange("error");
+      this.setState("error");
       console.error("[vault-sync] Start failed:", e);
-      this.onError(`Sync start failed: ${(e as Error).message}`);
+      this.setError(`Sync start failed: ${(e as Error).message}`);
     }
   }
 
@@ -130,7 +164,7 @@ export class SyncEngine {
       clearTimeout(timer);
     }
     this.pendingWrites.clear();
-    this.onStateChange("idle");
+    this.setState("idle");
   }
 
   // --- Full sync (initial or manual) ---
@@ -144,7 +178,7 @@ export class SyncEngine {
   }
 
   async fullSync(): Promise<void> {
-    this.onStateChange("syncing");
+    this.setState("syncing");
     try {
       // Fetch remote rev index (no content) -- lightweight, ~15K rows with just id+rev
       const remoteIndex = await this.client.allDocs({
@@ -159,9 +193,9 @@ export class SyncEngine {
       await this.pushAllLocal(remoteRevs);
       await this.pullAllRemote(remoteRevs);
       this.persistState();
-      this.onStateChange("ok");
+      this.setState("ok");
     } catch (e) {
-      this.onStateChange("error");
+      this.setState("error");
       throw e;
     }
   }
@@ -237,7 +271,7 @@ export class SyncEngine {
           if (putErr instanceof CouchError && putErr.status === 409) {
             await this.resolveConflict(doc._id, doc.content, doc.mtime);
           } else {
-            this.onError(`Push failed for ${doc._id}: ${(putErr as Error).message}`);
+            this.setError(`Push failed for ${doc._id}: ${(putErr as Error).message}`);
           }
         }
       }
@@ -251,7 +285,8 @@ export class SyncEngine {
 
   /**
    * Pull remote docs that are new or changed since last sync.
-   * Fetches content individually for docs whose rev differs from local revMap.
+   * Uses batched _all_docs with include_docs to avoid N+1 individual GETs.
+   * This is critical for mobile where 14K individual requests would fail silently.
    */
   private async pullAllRemote(remoteRevs: Map<string, string>): Promise<void> {
     const toPull: string[] = [];
@@ -266,27 +301,52 @@ export class SyncEngine {
     if (toPull.length > 0) {
       this.applyingRemote = true;
       this.pullCount = toPull.length;
+      this.pullTotal = toPull.length;
+      this.pullFetched = 0;
       this.emitCounts();
+      let failCount = 0;
       try {
-        for (let i = 0; i < toPull.length; i++) {
-          const docId = toPull[i];
+        // Batch fetch using _all_docs with keys (POST) to avoid N+1 requests.
+        // CouchDB supports POST to _all_docs with {"keys": [...]} body.
+        for (let offset = 0; offset < toPull.length; offset += PULL_BATCH_SIZE) {
+          const batch = toPull.slice(offset, offset + PULL_BATCH_SIZE);
           try {
-            const doc = await this.client.get(docId);
-            await this.applyRemoteDoc(doc);
-            if (doc._rev) {
-              this.revMap[docId] = doc._rev;
+            const result = await this.client.allDocsByKeys(batch);
+            for (const row of result.rows) {
+              if (row.error || !row.doc) {
+                failCount++;
+                console.warn(`[vault-sync] Pull skip: ${row.key} (${row.error ?? "no doc"})`);
+                continue;
+              }
+              try {
+                await this.applyRemoteDoc(row.doc);
+                if (row.doc._rev) {
+                  this.revMap[row.doc._id] = row.doc._rev;
+                }
+              } catch (applyErr) {
+                failCount++;
+                console.warn(`[vault-sync] Pull apply failed: ${row.doc._id}: ${(applyErr as Error).message}`);
+              }
+              this.pullFetched++;
+              this.pullCount--;
+              this.emitCounts();
             }
-          } catch {
-            // Skip docs that fail to fetch
+          } catch (batchErr) {
+            // Entire batch failed -- log and continue with next batch
+            failCount += batch.length;
+            console.error(`[vault-sync] Pull batch failed at offset ${offset}: ${(batchErr as Error).message}`);
+            this.setError(`Pull batch failed: ${(batchErr as Error).message}`);
           }
-          this.pullCount--;
-          this.emitCounts();
-          if (i % 10 === 9) await this.yield();
-          // Persist every 100 docs to survive interruptions
-          if (i % 100 === 99) this.persistState();
+          await this.yield();
+          this.persistState();
+        }
+        if (failCount > 0) {
+          console.warn(`[vault-sync] Pull complete with ${failCount} failures out of ${toPull.length}`);
         }
       } finally {
         this.pullCount = 0;
+        this.pullTotal = 0;
+        this.pullFetched = 0;
         this.applyingRemote = false;
         this.emitCounts();
       }
@@ -322,7 +382,7 @@ export class SyncEngine {
 
       this.lastSeq = result.last_seq;
       this.persistState();
-      this.onStateChange("ok");
+      this.setState("ok");
 
       // Poll again after interval (normal feed, not longpoll)
       if (this.running) {
@@ -335,8 +395,8 @@ export class SyncEngine {
       const msg = (e as Error).message || "";
       if (msg.includes("aborted") || msg.includes("AbortError")) return;
 
-      this.onStateChange("offline");
-      this.onError(`Changes feed error: ${msg}`);
+      this.setState("offline");
+      this.setError(`Changes feed error: ${msg}`);
 
       // Backoff retry
       if (this.running) {
@@ -481,7 +541,7 @@ export class SyncEngine {
         this.persistState();
       }
     } catch (e) {
-      this.onError(`Failed to delete remote ${file.path}: ${(e as Error).message}`);
+      this.setError(`Failed to delete remote ${file.path}: ${(e as Error).message}`);
     }
   }
 
@@ -548,7 +608,7 @@ export class SyncEngine {
         }
       }
     } catch (e) {
-      this.onError(`Push failed for ${file.path}: ${(e as Error).message}`);
+      this.setError(`Push failed for ${file.path}: ${(e as Error).message}`);
     }
   }
 
@@ -607,6 +667,7 @@ export class SyncEngine {
       pendingPush: this.pendingWrites.size,
       pendingPull: this.pullCount,
     });
+    this.onDiagnosticsChange();
   }
 
   // --- Utilities ---

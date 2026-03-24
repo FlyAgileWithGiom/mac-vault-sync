@@ -1,13 +1,25 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type VaultSyncPlugin from "./main";
+import type { SyncDiagnostics } from "./types";
 
 /**
  * Settings tab for Vault Sync plugin.
  * Provides CouchDB connection configuration and sync behavior options.
  */
 export class VaultSyncSettingTab extends PluginSettingTab {
+  private diagnosticsEl: HTMLElement | null = null;
+  private unsubDiagnostics: (() => void) | null = null;
+
   constructor(app: App, private plugin: VaultSyncPlugin) {
     super(app, plugin);
+  }
+
+  hide(): void {
+    // Clean up live update subscription when settings tab is closed
+    if (this.unsubDiagnostics) {
+      this.unsubDiagnostics();
+      this.unsubDiagnostics = null;
+    }
   }
 
   display(): void {
@@ -138,5 +150,45 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           }, 2000);
         })
       );
+
+    // --- Diagnostics section (provides observability on mobile) ---
+    containerEl.createEl("h3", { text: "Diagnostics" });
+    this.diagnosticsEl = containerEl.createEl("div", { cls: "vault-sync-diagnostics" });
+    this.renderDiagnostics();
+
+    // Subscribe to live updates while settings tab is open
+    if (this.unsubDiagnostics) this.unsubDiagnostics();
+    const handler = () => this.renderDiagnostics();
+    this.plugin.subscribeDiagnostics(handler);
+    this.unsubDiagnostics = () => this.plugin.unsubscribeDiagnostics(handler);
+  }
+
+  private renderDiagnostics(): void {
+    if (!this.diagnosticsEl) return;
+    const d = this.plugin.getDiagnostics();
+    this.diagnosticsEl.empty();
+
+    const table = this.diagnosticsEl.createEl("table", { cls: "vault-sync-diag-table" });
+    const rows: [string, string][] = [
+      ["Status", d.state],
+      ["Running", d.running ? "yes" : "no"],
+      ["Tracked docs (revMap)", String(d.revMapSize)],
+      ["Last sequence", String(d.lastSeq)],
+      ["Pending push", String(d.pendingPushCount)],
+    ];
+
+    if (d.pullProgress) {
+      rows.push(["Pull progress", `${d.pullProgress.fetched} / ${d.pullProgress.total}`]);
+    }
+
+    if (d.lastError) {
+      rows.push(["Last error", d.lastError]);
+    }
+
+    for (const [label, value] of rows) {
+      const tr = table.createEl("tr");
+      tr.createEl("td", { text: label, cls: "vault-sync-diag-label" });
+      tr.createEl("td", { text: value, cls: "vault-sync-diag-value" });
+    }
   }
 }
