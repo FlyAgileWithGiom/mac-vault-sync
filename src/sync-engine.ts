@@ -290,12 +290,32 @@ export class SyncEngine {
    * Uses batched _all_docs with include_docs to avoid N+1 individual GETs.
    * This is critical for mobile where 14K individual requests would fail silently.
    */
+  /** Skip binary extensions that have no text content in CouchDB */
+  private static readonly BINARY_EXTENSIONS = new Set([
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "svgz", "ico",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "mp3", "m4a", "wav", "ogg", "flac",
+    "mp4", "mov", "avi", "mkv", "webm",
+    "zip", "tar", "gz", "rar", "7z",
+    "bin", "heic", "drawing", "writing",
+  ]);
+
+  private isBinaryDoc(docId: string): boolean {
+    const ext = docId.split(".").pop()?.toLowerCase() ?? "";
+    return SyncEngine.BINARY_EXTENSIONS.has(ext);
+  }
+
   private async pullAllRemote(remoteRevs: Map<string, string>): Promise<void> {
     const toPull: string[] = [];
+    let skippedBinary = 0;
     for (const [docId, rev] of remoteRevs) {
       if (docId.startsWith("_design/")) continue;
       if (this.revMap[docId] === rev) continue;
+      if (this.isBinaryDoc(docId)) { skippedBinary++; continue; }
       toPull.push(docId);
+    }
+    if (skippedBinary > 0) {
+      console.log(`[vault-sync] Pull: skipped ${skippedBinary} binary docs`);
     }
 
     console.log(`[vault-sync] Pull: ${toPull.length} docs to fetch`);
