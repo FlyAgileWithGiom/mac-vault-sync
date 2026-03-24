@@ -330,30 +330,50 @@ export class SyncEngine {
       this.emitCounts();
       let failCount = 0;
       try {
-        // Fetch docs individually via GET (POST _all_docs has encoding issues with requestUrl).
-        // Process in small batches with yield to keep UI responsive.
-        for (let i = 0; i < toPull.length; i++) {
-          const docId = toPull[i];
+        // Batch fetch via POST _all_docs with keys. Falls back to individual GETs on failure.
+        for (let offset = 0; offset < toPull.length; offset += PULL_BATCH_SIZE) {
+          const batchKeys = toPull.slice(offset, offset + PULL_BATCH_SIZE);
+          let docs: (CouchDoc | null)[];
+
           try {
-            const doc = await this.client.get(docId);
-            await this.applyRemoteDoc(doc);
-            if (doc._rev) {
-              this.revMap[doc._id] = doc._rev;
-              this.pullApplied++;
-            }
-          } catch (e) {
-            failCount++;
-            this.pullSkipped++;
-            // Log first few errors to diagnostics for debugging
-            if (failCount <= 3) {
-              this.setError(`Pull[${i}] ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+            const result = await this.client.allDocsByKeys(batchKeys);
+            docs = result.rows.map((row) => (row.error || !row.doc) ? null : row.doc);
+          } catch {
+            // Batch failed -- fall back to individual GETs
+            docs = [];
+            for (const docId of batchKeys) {
+              try {
+                docs.push(await this.client.get(docId));
+              } catch {
+                docs.push(null);
+              }
             }
           }
-          this.pullFetched++;
-          this.pullCount--;
-          this.emitCounts();
-          if (i % 10 === 9) await this.yield();
-          if (i % 100 === 99) this.persistState();
+
+          for (const doc of docs) {
+            if (doc) {
+              try {
+                await this.applyRemoteDoc(doc);
+                if (doc._rev) {
+                  this.revMap[doc._id] = doc._rev;
+                  this.pullApplied++;
+                }
+              } catch (e) {
+                failCount++;
+                this.pullSkipped++;
+                if (failCount <= 3) {
+                  this.setError(`Pull ${doc._id.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+                }
+              }
+            } else {
+              this.pullSkipped++;
+            }
+            this.pullFetched++;
+            this.pullCount--;
+            this.emitCounts();
+          }
+          await this.yield();
+          this.persistState();
         }
         if (failCount > 0) {
           console.warn(`[vault-sync] Pull complete with ${failCount} failures out of ${toPull.length}`);

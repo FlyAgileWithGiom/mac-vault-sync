@@ -237,7 +237,15 @@ describe("SyncEngine", () => {
           value: { rev: "1-r" },
         }],
       });
-      client.get.mockResolvedValue({ _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/remote.md",
+          key: "file/notes/remote.md",
+          value: { rev: "1-r" },
+          doc: { _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 },
+        }],
+      });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
@@ -264,7 +272,15 @@ describe("SyncEngine", () => {
           value: { rev: "2-r" },
         }],
       });
-      client.get.mockResolvedValue({ _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/shared.md",
+          key: "file/notes/shared.md",
+          value: { rev: "2-r" },
+          doc: { _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 },
+        }],
+      });
       client.changes.mockResolvedValue({ last_seq: "2", results: [] });
 
       await engine2.start();
@@ -289,6 +305,101 @@ describe("SyncEngine", () => {
       await engine.start();
 
       expect(vault.getAbstractFileByPath("_design/views")).toBeNull();
+    });
+
+    it("uses batch pull via allDocsByKeys for speed", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 2,
+        rows: [
+          { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "1-a" } },
+          { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "1-b" } },
+        ],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 2,
+        rows: [
+          { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "1-a" }, doc: { _id: "file/notes/a.md", _rev: "1-a", content: "aaa", mtime: 1000 } },
+          { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "1-b" }, doc: { _id: "file/notes/b.md", _rev: "1-b", content: "bbb", mtime: 2000 } },
+        ],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(client.allDocsByKeys).toHaveBeenCalled();
+      expect(client.get).not.toHaveBeenCalled(); // Should NOT use individual GETs
+      expect(vault._getContent("notes/a.md")).toBe("aaa");
+      expect(vault._getContent("notes/b.md")).toBe("bbb");
+    });
+
+    it("skips docs with null content in batch pull", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 2,
+        rows: [
+          { id: "file/notes/text.md", key: "file/notes/text.md", value: { rev: "1-t" } },
+          { id: "file/images/photo.png", key: "file/images/photo.png", value: { rev: "1-p" } },
+        ],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 2,
+        rows: [
+          { id: "file/notes/text.md", key: "file/notes/text.md", value: { rev: "1-t" }, doc: { _id: "file/notes/text.md", _rev: "1-t", content: "hello", mtime: 1000 } },
+          { id: "file/images/photo.png", key: "file/images/photo.png", value: { rev: "1-p" }, doc: { _id: "file/images/photo.png", _rev: "1-p", content: null, mtime: 2000, _attachments: {} } },
+        ],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(vault._getContent("notes/text.md")).toBe("hello");
+      expect(vault._getContent("images/photo.png")).toBeUndefined(); // null content skipped
+    });
+
+    it("skips binary extensions in pull", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 2,
+        rows: [
+          { id: "file/notes/text.md", key: "file/notes/text.md", value: { rev: "1-t" } },
+          { id: "file/images/photo.jpg", key: "file/images/photo.jpg", value: { rev: "1-j" } },
+        ],
+      });
+      // allDocsByKeys should only be called with the .md doc, not .jpg
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [
+          { id: "file/notes/text.md", key: "file/notes/text.md", value: { rev: "1-t" }, doc: { _id: "file/notes/text.md", _rev: "1-t", content: "hello", mtime: 1000 } },
+        ],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(vault._getContent("notes/text.md")).toBe("hello");
+      // Verify allDocsByKeys was called without the .jpg
+      const calledKeys = client.allDocsByKeys.mock.calls[0][0];
+      expect(calledKeys).not.toContain("file/images/photo.jpg");
+    });
+
+    it("falls back to individual GETs when batch fails", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [
+          { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "1-a" } },
+        ],
+      });
+      // Batch fails (timeout/encoding)
+      client.allDocsByKeys.mockRejectedValue(new Error("Request timed out"));
+      // Fallback to individual GET
+      client.get.mockResolvedValue({ _id: "file/notes/a.md", _rev: "1-a", content: "aaa", mtime: 1000 });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(vault._getContent("notes/a.md")).toBe("aaa");
     });
   });
 
