@@ -231,9 +231,9 @@ describe("SyncEngine", () => {
   });
 
   describe("fullSync - pull", () => {
-    it("creates local files from remote docs", async () => {
+    it("populates revMap on first sync without pulling content", async () => {
+      // First sync (empty revMap) should trust the index and skip content pull
       const client = getClient(engine);
-      // allDocs returns rev index (no content)
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
@@ -242,13 +242,17 @@ describe("SyncEngine", () => {
           value: { rev: "1-r" },
         }],
       });
-      // get() returns full doc when pulled
-      client.get.mockResolvedValue({ _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
 
-      expect(vault._getContent("notes/remote.md")).toBe("from remote");
+      // Content not pulled on first sync - will come via changes feed
+      expect(vault._getContent("notes/remote.md")).toBeUndefined();
+      // But revMap should be populated
+      expect(localStorage.setItem).toHaveBeenCalledWith(
+        "vault-sync-revmap",
+        expect.stringContaining("file/notes/remote.md")
+      );
     });
 
     it("overwrites local file when remote is newer", async () => {
