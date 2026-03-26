@@ -486,9 +486,18 @@ export class SyncEngine {
     setTimeout(() => this.recentRemotePaths.delete(normalized), 2000);
 
     if (existing instanceof TFile) {
-      // Compare mtime: only overwrite if remote is newer
-      if (doc.mtime > existing.stat.mtime) {
+      // Compare mtime: overwrite if remote is newer.
+      // When mtime is missing/0 (external tool update), fall back to content comparison.
+      const remoteMtime = doc.mtime || 0;
+      const localMtime = existing.stat.mtime || 0;
+      if (remoteMtime > localMtime) {
         await this.vault.modify(existing, doc.content);
+      } else if (!remoteMtime || remoteMtime === localMtime) {
+        // No mtime or same mtime: apply if content actually differs
+        const localContent = await this.vault.cachedRead(existing);
+        if (localContent !== doc.content) {
+          await this.vault.modify(existing, doc.content);
+        }
       }
     } else if (!existing) {
       // New file from remote - ensure parent directories exist

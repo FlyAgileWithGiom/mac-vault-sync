@@ -383,6 +383,136 @@ describe("SyncEngine", () => {
       expect(calledKeys).not.toContain("file/images/photo.jpg");
     });
 
+    it("applies remote doc when mtime is missing (external tool update)", async () => {
+      // When an external tool (e.g., Claude) writes to CouchDB without mtime,
+      // the doc should still be applied to the vault
+      vault._addFile("notes/external.md", "old content", 1000);
+
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/external.md": "1-old" });
+      const engine2 = new SyncEngine(settings, vault as any);
+      engine2.onStateChange = () => {};
+      engine2.onError = () => {};
+
+      const client = getClient(engine2);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/external.md", key: "file/notes/external.md", value: { rev: "2-ext" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/external.md",
+          key: "file/notes/external.md",
+          value: { rev: "2-ext" },
+          doc: { _id: "file/notes/external.md", _rev: "2-ext", content: "updated by external tool" },
+        }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "2", results: [] });
+
+      await engine2.start();
+
+      expect(vault._getContent("notes/external.md")).toBe("updated by external tool");
+      engine2.stop();
+    });
+
+    it("applies remote doc when mtime is 0 (external tool update)", async () => {
+      vault._addFile("notes/zero-mtime.md", "old content", 1000);
+
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/zero-mtime.md": "1-old" });
+      const engine2 = new SyncEngine(settings, vault as any);
+      engine2.onStateChange = () => {};
+      engine2.onError = () => {};
+
+      const client = getClient(engine2);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/zero-mtime.md", key: "file/notes/zero-mtime.md", value: { rev: "2-ext" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/zero-mtime.md",
+          key: "file/notes/zero-mtime.md",
+          value: { rev: "2-ext" },
+          doc: { _id: "file/notes/zero-mtime.md", _rev: "2-ext", content: "updated with mtime 0", mtime: 0 },
+        }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "2", results: [] });
+
+      await engine2.start();
+
+      expect(vault._getContent("notes/zero-mtime.md")).toBe("updated with mtime 0");
+      engine2.stop();
+    });
+
+    it("applies remote doc when mtime equals local but content differs", async () => {
+      vault._addFile("notes/same-mtime.md", "local version", 5000);
+
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/same-mtime.md": "1-old" });
+      const engine2 = new SyncEngine(settings, vault as any);
+      engine2.onStateChange = () => {};
+      engine2.onError = () => {};
+
+      const client = getClient(engine2);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/same-mtime.md", key: "file/notes/same-mtime.md", value: { rev: "2-r" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/same-mtime.md",
+          key: "file/notes/same-mtime.md",
+          value: { rev: "2-r" },
+          doc: { _id: "file/notes/same-mtime.md", _rev: "2-r", content: "remote version", mtime: 5000 },
+        }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "2", results: [] });
+
+      await engine2.start();
+
+      expect(vault._getContent("notes/same-mtime.md")).toBe("remote version");
+      engine2.stop();
+    });
+
+    it("applies remote changes from changes feed when mtime is missing", async () => {
+      vault._addFile("notes/feed.md", "old content", 1000);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/feed.md", key: "file/notes/feed.md", value: { rev: "1-r" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/feed.md",
+          key: "file/notes/feed.md",
+          value: { rev: "1-r" },
+          doc: { _id: "file/notes/feed.md", _rev: "1-r", content: "old content", mtime: 1000 },
+        }],
+      });
+      // First changes call for initial sync
+      client.changes.mockResolvedValueOnce({ last_seq: "1", results: [] });
+      // Second changes call returns an update with no mtime
+      client.changes.mockResolvedValueOnce({
+        last_seq: "2",
+        results: [{
+          seq: "2",
+          id: "file/notes/feed.md",
+          changes: [{ rev: "2-r" }],
+          doc: { _id: "file/notes/feed.md", _rev: "2-r", content: "updated by Claude" },
+        }],
+      });
+
+      await engine.start();
+
+      // Wait for the first poll cycle
+      await new Promise((r) => setTimeout(r, 3500));
+
+      expect(vault._getContent("notes/feed.md")).toBe("updated by Claude");
+    });
+
     it("falls back to individual GETs when batch fails", async () => {
       const client = getClient(engine);
       client.allDocs.mockResolvedValue({
