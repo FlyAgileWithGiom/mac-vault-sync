@@ -387,6 +387,18 @@ export class SyncEngine {
       }
     }
 
+    // Detect remote deletions: files in revMap but not in remote index
+    this.applyingRemote = true;
+    try {
+      for (const docId of Object.keys(this.revMap)) {
+        if (!remoteRevs.has(docId)) {
+          await this.handleRemoteDelete(docId);
+        }
+      }
+    } finally {
+      this.applyingRemote = false;
+    }
+
     // Get current sequence for changes feed
     const changes = await this.client.changes(0, { limit: 0, include_docs: false });
     this.lastSeq = changes.last_seq;
@@ -578,6 +590,7 @@ export class SyncEngine {
 
     const docId = pathToDocId(file.path);
     const rev = this.revMap[docId];
+    console.log(`[vault-sync] Delete: ${file.path} docId=${docId} rev=${rev ?? "NONE"}`);
     if (!rev) return; // Never synced, nothing to do
 
     try {

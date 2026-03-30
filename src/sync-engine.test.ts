@@ -531,6 +531,34 @@ describe("SyncEngine", () => {
 
       expect(vault._getContent("notes/a.md")).toBe("aaa");
     });
+
+    it("deletes local files that were deleted on remote", async () => {
+      // File exists locally and in revMap (was synced before)
+      vault._addFile("notes/deleted-remote.md", "old content", 1000);
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({
+        "file/notes/deleted-remote.md": "1-old",
+        "file/notes/still-exists.md": "1-a",
+      });
+      const engine2 = new SyncEngine(settings, vault as any);
+      engine2.onStateChange = () => {};
+      engine2.onError = () => {};
+
+      const client = getClient(engine2);
+      // Remote only has still-exists.md -- deleted-remote.md was deleted on remote
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [
+          { id: "file/notes/still-exists.md", key: "file/notes/still-exists.md", value: { rev: "1-a" } },
+        ],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine2.start();
+
+      // deleted-remote.md should be deleted locally
+      expect(vault.getAbstractFileByPath("notes/deleted-remote.md")).toBeNull();
+      engine2.stop();
+    });
   });
 
   describe("local change handlers", () => {
