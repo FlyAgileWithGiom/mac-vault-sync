@@ -15,7 +15,7 @@ const SEQ_KEY = "vault-sync-last-seq";
 const DOC_PREFIX = "file/";
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
-const ATTACHMENT_NAME = "data";
+const ATTACHMENT_NAME = "data.bin";
 
 const CONTENT_TYPE_MAP: Record<string, string> = {
   png: "image/png",
