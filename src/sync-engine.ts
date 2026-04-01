@@ -15,6 +15,7 @@ const SEQ_KEY = "vault-sync-last-seq";
 const DOC_PREFIX = "file/";
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
+const PARALLEL_BINARY_PULLS = 5; // Concurrent attachment downloads
 const ATTACHMENT_NAME = "data.bin";
 
 const CONTENT_TYPE_MAP: Record<string, string> = {
@@ -448,6 +449,7 @@ export class SyncEngine {
       }
     }
 
+    const pending: string[] = [];
     for (let i = 0; i < docIds.length; i++) {
       const docId = docIds[i];
       if (!hasAttachment.has(docId)) {
@@ -461,21 +463,35 @@ export class SyncEngine {
         continue;
       }
 
-      try {
-        const data = await this.client.getAttachment(docId, ATTACHMENT_NAME);
-        await this.applyRemoteBinary(docId, data);
-        const rev = remoteRevs.get(docId);
-        if (rev) this.revMap[docId] = rev;
-        this.pullApplied++;
-      } catch (e) {
-        this.pullSkipped++;
-        this.setError(`Binary pull ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+      pending.push(docId);
+
+      // Launch parallel batch when we hit PARALLEL_BINARY_PULLS
+      if (pending.length >= PARALLEL_BINARY_PULLS || i === docIds.length - 1) {
+        const batch = pending.splice(0);
+        const results = await Promise.allSettled(
+          batch.map(async (id) => {
+            const data = await this.client.getAttachment(id, ATTACHMENT_NAME);
+            await this.applyRemoteBinary(id, data);
+            return id;
+          })
+        );
+        for (let j = 0; j < results.length; j++) {
+          const result = results[j];
+          if (result.status === "fulfilled") {
+            const rev = remoteRevs.get(result.value);
+            if (rev) this.revMap[result.value] = rev;
+            this.pullApplied++;
+          } else {
+            this.pullSkipped++;
+            this.setError(`Binary pull ${batch[j].slice(0, 40)}: ${result.reason?.message?.slice(0, 80)}`);
+          }
+          this.pullFetched++;
+          this.pullCount--;
+        }
+        this.emitCounts();
+        await this.yield();
+        this.persistState();
       }
-      this.pullFetched++;
-      this.pullCount--;
-      this.emitCounts();
-      if (i % 5 === 4) await this.yield();
-      if (i % 50 === 49) this.persistState();
     }
   }
 
