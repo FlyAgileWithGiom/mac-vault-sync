@@ -33,7 +33,9 @@ export class TAbstractFile {
   path = "";
 }
 
-export class TFolder extends TAbstractFile {}
+export class TFolder extends TAbstractFile {
+  children: TAbstractFile[] = [];
+}
 
 export function normalizePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+/g, "/");
@@ -42,6 +44,7 @@ export function normalizePath(path: string): string {
 export class Vault {
   private files: Map<string, { file: TFile; content: string }> = new Map();
   private binaryFiles: Map<string, { file: TFile; content: ArrayBuffer }> = new Map();
+  private folders: Map<string, TFolder> = new Map();
 
   getFiles(): TFile[] {
     return [
@@ -95,9 +98,12 @@ export class Vault {
     return this.binaryFiles.get(path)?.content;
   }
 
-  getAbstractFileByPath(path: string): TFile | null {
-    const entry = this.files.get(path) ?? this.binaryFiles.get(path);
-    return entry ? entry.file : null;
+  getAbstractFileByPath(path: string): TFile | TFolder | null {
+    const fileEntry = this.files.get(path) ?? this.binaryFiles.get(path);
+    if (fileEntry) return fileEntry.file;
+    const folder = this.folders.get(path);
+    if (folder) return folder;
+    return null;
   }
 
   async create(path: string, content: string): Promise<TFile> {
@@ -106,13 +112,19 @@ export class Vault {
     return file;
   }
 
-  async createFolder(_path: string): Promise<void> {
-    // no-op for testing
+  async createFolder(path: string): Promise<void> {
+    const folder = new TFolder();
+    folder.path = path;
+    this.folders.set(path, folder);
   }
 
-  async delete(file: TFile): Promise<void> {
-    this.files.delete(file.path);
-    this.binaryFiles.delete(file.path);
+  async delete(file: TFile | TFolder): Promise<void> {
+    if (file instanceof TFolder) {
+      this.folders.delete(file.path);
+    } else {
+      this.files.delete(file.path);
+      this.binaryFiles.delete(file.path);
+    }
   }
 
   // Test helpers (not in real Obsidian API)
@@ -124,6 +136,19 @@ export class Vault {
 
   _getContent(path: string): string | undefined {
     return this.files.get(path)?.content;
+  }
+
+  /** Create a folder with explicit children list for testing cleanup logic */
+  _addFolder(path: string, children: TAbstractFile[] = []): TFolder {
+    const folder = new TFolder();
+    folder.path = path;
+    folder.children = children;
+    this.folders.set(path, folder);
+    return folder;
+  }
+
+  _hasFolder(path: string): boolean {
+    return this.folders.has(path);
   }
 
   on(_event: string, _callback: (...args: unknown[]) => void): { unload: () => void } {

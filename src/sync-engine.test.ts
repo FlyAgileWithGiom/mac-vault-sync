@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { SyncEngine } from "./sync-engine";
 import { CouchClient } from "./couch-client";
-import { Vault, TFile } from "./__mocks__/obsidian";
+import { Vault, TFile, TFolder } from "./__mocks__/obsidian";
 import type { VaultSyncSettings, CouchDoc, CouchChangeRow } from "./types";
 
 // Mock CouchClient so we control all network behavior
@@ -1221,6 +1221,102 @@ describe("SyncEngine", () => {
         pngData,
         "image/png"
       );
+    });
+  });
+
+  describe("handleRemoteDelete - empty parent folder cleanup", () => {
+    // Helper: set up engine with a pre-populated revMap (simulates previously synced files),
+    // then trigger fullSync where the remote no longer has those docs → handleRemoteDelete fires.
+    function makeEngineWithRevMap(revMap: Record<string, string>): { engine2: SyncEngine; client2: ReturnType<typeof vi.fn> & Record<string, ReturnType<typeof vi.fn>> } {
+      localStorageMock["vault-sync-revmap"] = JSON.stringify(revMap);
+      const engine2 = new SyncEngine(settings, vault as any);
+      engine2.onStateChange = () => {};
+      engine2.onError = () => {};
+      const client2 = getClient(engine2);
+      return { engine2, client2 };
+    }
+
+    it("does not delete non-empty parent folder after remote file deletion", async () => {
+      // folder/file-to-delete.md is synced; folder/ has another file remaining
+      vault._addFile("folder/file-to-delete.md", "bye", 1000);
+      const siblingFile = new TFile("folder/sibling.md");
+      const folder = vault._addFolder("folder", [siblingFile]);
+
+      const { engine2, client2 } = makeEngineWithRevMap({
+        "file/folder/file-to-delete.md": "1-old",
+      });
+      // Remote has no docs (file-to-delete.md was deleted remotely)
+      client2.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client2.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine2.start();
+
+      // file should be deleted
+      expect(vault.getAbstractFileByPath("folder/file-to-delete.md")).toBeNull();
+      // folder should still exist (non-empty — sibling remains)
+      expect(vault._hasFolder("folder")).toBe(true);
+      engine2.stop();
+    });
+
+    it("deletes empty parent folder after remote file deletion", async () => {
+      // folder/last-file.md is the only file; folder/ will be empty after deletion
+      vault._addFile("folder/last-file.md", "content", 1000);
+      vault._addFolder("folder", []); // no children after deletion
+
+      const { engine2, client2 } = makeEngineWithRevMap({
+        "file/folder/last-file.md": "1-old",
+      });
+      client2.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client2.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine2.start();
+
+      expect(vault.getAbstractFileByPath("folder/last-file.md")).toBeNull();
+      expect(vault._hasFolder("folder")).toBe(false);
+      engine2.stop();
+    });
+
+    it("deletes nested empty folders up to first non-empty ancestor", async () => {
+      // a/b/c/file.md is deleted; a/b/c/ and a/b/ become empty, but a/ still has other content
+      vault._addFile("a/b/c/file.md", "deep", 1000);
+      const otherFile = new TFile("a/other.md");
+      vault._addFolder("a/b/c", []);  // empty after deletion
+      vault._addFolder("a/b", []);    // empty after c/ is removed
+      vault._addFolder("a", [otherFile]); // still has other.md
+
+      const { engine2, client2 } = makeEngineWithRevMap({
+        "file/a/b/c/file.md": "1-old",
+      });
+      client2.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client2.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine2.start();
+
+      expect(vault.getAbstractFileByPath("a/b/c/file.md")).toBeNull();
+      expect(vault._hasFolder("a/b/c")).toBe(false);
+      expect(vault._hasFolder("a/b")).toBe(false);
+      expect(vault._hasFolder("a")).toBe(true); // non-empty ancestor preserved
+      engine2.stop();
+    });
+
+    it("does not delete excluded folders", async () => {
+      // .obsidian/plugins/file.md is excluded; even if the folder would be empty, skip it
+      vault._addFile(".obsidian/plugins/file.md", "plugin", 1000);
+      vault._addFolder(".obsidian/plugins", []);
+      vault._addFolder(".obsidian", []);
+
+      const { engine2, client2 } = makeEngineWithRevMap({
+        "file/.obsidian/plugins/file.md": "1-old",
+      });
+      client2.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client2.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine2.start();
+
+      // The path is excluded so handleRemoteDelete returns early — file stays, folder stays
+      expect(vault.getAbstractFileByPath(".obsidian/plugins/file.md")).not.toBeNull();
+      expect(vault._hasFolder(".obsidian/plugins")).toBe(true);
+      engine2.stop();
     });
   });
 });
