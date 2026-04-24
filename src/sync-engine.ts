@@ -859,10 +859,26 @@ export class SyncEngine {
         }
       }
 
-      const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, rev, data, contentType);
-      if (result.ok && result.rev) {
-        this.revMap[docId] = result.rev;
-        this.persistState();
+      const MAX_RETRIES = 3;
+      let attachmentRev = rev;
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType);
+          if (result.ok && result.rev) {
+            this.revMap[docId] = result.rev;
+            this.persistState();
+          }
+          break;
+        } catch (e) {
+          if (e instanceof CouchError && e.status === 409 && attempt < MAX_RETRIES - 1) {
+            // Rev became stale between stub PUT and attachment PUT — refetch and retry
+            const fresh = await this.client.get(docId);
+            attachmentRev = fresh._rev ?? "";
+            this.revMap[docId] = attachmentRev;
+          } else {
+            throw e;
+          }
+        }
       }
     } catch (e) {
       this.setError(`Binary push failed for ${file.path}: ${(e as Error).message}`);
