@@ -1302,6 +1302,91 @@ describe("SyncEngine", () => {
         "image/png"
       );
     });
+
+    it("retries putAttachment with fresh rev when 409 conflict occurs", async () => {
+      // Pre-populate revMap so engine skips stub-creation and goes straight to putAttachment
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/images/conflict.jpeg": "1-stale" });
+      const conflictEngine = new SyncEngine(settings, vault as any);
+      conflictEngine.onStateChange = () => {};
+      conflictEngine.onError = (msg) => errors.push(msg);
+      const conflictClient = getClient(conflictEngine);
+
+      const jpegData = new Uint8Array([0xff, 0xd8, 0xff]).buffer;
+      conflictClient.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      conflictClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      const { CouchError } = await import("./couch-client");
+      // First putAttachment call fails with 409, second succeeds with fresh rev
+      conflictClient.putAttachment = vi.fn()
+        .mockRejectedValueOnce(new CouchError(409, "Document update conflict."))
+        .mockResolvedValueOnce({ ok: true, id: "file/images/conflict.jpeg", rev: "3-fresh" });
+      // get() returns the doc with fresh rev after the 409
+      conflictClient.get = vi.fn().mockResolvedValue({
+        _id: "file/images/conflict.jpeg",
+        _rev: "2-fresh",
+        content: null,
+        mtime: 1000,
+      });
+
+      await conflictEngine.start();
+
+      const file = vault._addBinaryFile("images/conflict.jpeg", jpegData);
+      conflictEngine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 120));
+
+      // putAttachment should have been called twice (once with stale rev, once with fresh rev)
+      expect(conflictClient.putAttachment).toHaveBeenCalledTimes(2);
+      // Second call must use the fresh rev fetched from get()
+      expect(conflictClient.putAttachment).toHaveBeenNthCalledWith(
+        2,
+        "file/images/conflict.jpeg",
+        "data.bin",
+        "2-fresh",
+        jpegData,
+        "image/jpeg"
+      );
+      // No error should be surfaced on successful retry
+      expect(errors).toHaveLength(0);
+
+      conflictEngine.stop();
+    });
+
+    it("surfaces error via setError when all binary 409 retries are exhausted", async () => {
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/images/persistent.jpeg": "1-stale" });
+      const retryEngine = new SyncEngine(settings, vault as any);
+      retryEngine.onStateChange = () => {};
+      const retryErrors: string[] = [];
+      retryEngine.onError = (msg) => retryErrors.push(msg);
+      const retryClient = getClient(retryEngine);
+
+      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+      retryClient.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      retryClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      const { CouchError } = await import("./couch-client");
+      // All 3 putAttachment attempts fail with 409
+      retryClient.putAttachment = vi.fn()
+        .mockRejectedValue(new CouchError(409, "Document update conflict."));
+      // get() always returns a fresh-looking rev (but another client keeps winning)
+      retryClient.get = vi.fn().mockResolvedValue({
+        _id: "file/images/persistent.jpeg",
+        _rev: "2-never-wins",
+        content: null,
+        mtime: 1000,
+      });
+
+      await retryEngine.start();
+
+      const file = vault._addBinaryFile("images/persistent.jpeg", jpegData);
+      retryEngine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 120));
+
+      // After MAX_RETRIES exhausted, error must be surfaced
+      expect(retryErrors).toHaveLength(1);
+      expect(retryErrors[0]).toContain("Binary push failed for images/persistent.jpeg");
+
+      retryEngine.stop();
+    });
   });
 
   describe("handleRemoteDelete - empty parent folder cleanup", () => {
