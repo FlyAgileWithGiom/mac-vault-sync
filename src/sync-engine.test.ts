@@ -344,11 +344,15 @@ describe("SyncEngine", () => {
       const client = getClient(engine);
       // allDocs returns [] — the file is not there (deleted on server, tombstone not in allDocs)
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
-      // GET for the doc returns a tombstone (deleted: true)
-      client.get.mockResolvedValue({
-        _id: "file/notes/deleted-on-server.md",
-        _rev: "3-abc",
-        deleted: true,
+      // allDocsByKeys batch call returns a tombstone for the file
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/deleted-on-server.md",
+          key: "file/notes/deleted-on-server.md",
+          value: { rev: "3-abc" },
+          doc: { _id: "file/notes/deleted-on-server.md", _rev: "3-abc", deleted: true, content: null, mtime: 0 },
+        }],
       });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
@@ -367,6 +371,73 @@ describe("SyncEngine", () => {
       );
       // File should be deleted locally
       expect(vault.getAbstractFileByPath("notes/deleted-on-server.md")).toBeNull();
+    });
+
+    it("checks tombstones with a single batch call, not individual GETs, when syncing with empty revMap", async () => {
+      // Fresh install: 3 local files, remote allDocs returns [] (all are "new" to remote)
+      vault._addFile("notes/tombstone-a.md", "content a", 1000);
+      vault._addFile("notes/tombstone-b.md", "content b", 2000);
+      vault._addFile("notes/new-file.md", "content new", 3000);
+
+      const client = getClient(engine);
+      // allDocs returns empty — all 3 files are "unknown" to remote
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      // allDocsByKeys returns 2 files as tombstones, 1 as not_found
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 3,
+        rows: [
+          {
+            id: "file/notes/tombstone-a.md",
+            key: "file/notes/tombstone-a.md",
+            value: { rev: "3-tomb", deleted: true },
+            doc: { _id: "file/notes/tombstone-a.md", _rev: "3-tomb", deleted: true },
+          },
+          {
+            id: "file/notes/tombstone-b.md",
+            key: "file/notes/tombstone-b.md",
+            value: { rev: "2-tomb", deleted: true },
+            doc: { _id: "file/notes/tombstone-b.md", _rev: "2-tomb", deleted: true },
+          },
+          {
+            id: "file/notes/new-file.md",
+            key: "file/notes/new-file.md",
+            error: "not_found",
+          },
+        ],
+      });
+      client.bulkDocs.mockResolvedValue([
+        { ok: true, id: "file/notes/new-file.md", rev: "1-aaa" },
+      ]);
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      // allDocsByKeys called ONCE with all 3 docIds
+      expect(client.allDocsByKeys).toHaveBeenCalledTimes(1);
+      expect(client.allDocsByKeys).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          "file/notes/tombstone-a.md",
+          "file/notes/tombstone-b.md",
+          "file/notes/new-file.md",
+        ])
+      );
+      // The batch call arg should have exactly 3 entries (no extras from pull phase)
+      const batchCallArg = client.allDocsByKeys.mock.calls[0][0] as string[];
+      expect(batchCallArg).toHaveLength(3);
+
+      // client.get NOT called — no individual GETs
+      expect(client.get).not.toHaveBeenCalled();
+
+      // The 2 tombstoned files deleted locally
+      expect(vault.getAbstractFileByPath("notes/tombstone-a.md")).toBeNull();
+      expect(vault.getAbstractFileByPath("notes/tombstone-b.md")).toBeNull();
+
+      // The 1 not_found file pushed
+      expect(client.bulkDocs).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({ _id: "file/notes/new-file.md" }),
+        ])
+      );
     });
   });
 

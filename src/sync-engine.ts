@@ -249,52 +249,71 @@ export class SyncEngine {
   /**
    * Push local files that are new or changed since last sync.
    * Uses rev index (no content) to determine what needs pushing.
+   *
+   * Tombstone detection uses a single batch allDocsByKeys call instead of
+   * per-file GETs (avoids N+1 latency on fresh install with many files).
    */
   private async pushAllLocal(remoteRevs: Map<string, string>): Promise<void> {
     const files = this.vault.getFiles().filter((f) => !this.isExcluded(f.path) && f.size <= MAX_FILE_SIZE);
 
+    // Phase 1: collect files not present in the remote allDocs index
+    const unknownFiles = files.filter((f) => !remoteRevs.has(pathToDocId(f.path)));
+
+    // Phase 2: batch-check tombstones for all unknown files in a single request
+    const tombstoneIds = new Set<string>();
+    const existingIds = new Set<string>();
+    if (unknownFiles.length > 0) {
+      const unknownDocIds = unknownFiles.map((f) => pathToDocId(f.path));
+      const batchResult = await this.client.allDocsByKeys(unknownDocIds);
+      for (const row of batchResult.rows) {
+        if (row.doc?.deleted) {
+          // Server has a tombstone — must not resurrect this file
+          tombstoneIds.add(row.id);
+        } else if (!row.error && row.doc) {
+          // Doc exists with content but wasn't in allDocs index (edge case); let pull handle it
+          existingIds.add(row.id);
+        }
+      }
+    }
+
+    // Phase 3: push genuinely new files, delete locally any tombstoned ones
     const batch: CouchDoc[] = [];
 
     for (let fi = 0; fi < files.length; fi++) {
       const file = files[fi];
       const docId = pathToDocId(file.path);
-      const remoteRev = remoteRevs.get(docId);
-      const knownRev = this.revMap[docId];
       // Yield every 100 files to keep UI responsive
       if (fi % 100 === 99) await this.yield();
 
-      if (remoteRev) {
+      if (remoteRevs.has(docId)) {
         // Doc exists remotely - let pull handle content comparison
-        if (knownRev === remoteRev) continue; // Already synced
-        continue; // Rev unknown or changed - pull will handle
+        continue;
+      }
+
+      if (tombstoneIds.has(docId)) {
+        // Server has a tombstone — do not resurrect; delete locally
+        await this.handleRemoteDelete(docId);
+        continue;
+      }
+
+      if (existingIds.has(docId)) {
+        // Doc exists with content but wasn't in allDocs index (edge case); let pull handle it
+        continue;
+      }
+
+      // Genuinely new file, not on remote
+      if (this.isBinaryDoc(docId)) {
+        // Binary files need attachment PUT, not bulk_docs
+        await this.pushBinaryFile(file);
+        await this.yield();
       } else {
-        // File not in remote allDocs — check for tombstone before pushing
-        try {
-          const remote = await this.client.get(docId);
-          if (remote.deleted) {
-            // Server has a tombstone — do not resurrect; delete locally
-            await this.handleRemoteDelete(docId);
-            continue;
-          }
-          // Doc exists with content but wasn't in allDocs index (edge case); let pull handle it
-        } catch {
-          // 404 or network error: treat as genuinely new, fall through to push
-        }
+        const content = await this.vault.readText(file);
+        batch.push({ _id: docId, content, mtime: file.mtime });
 
-        // New file, not on remote
-        if (this.isBinaryDoc(docId)) {
-          // Binary files need attachment PUT, not bulk_docs
-          await this.pushBinaryFile(file);
+        // Flush in small chunks to avoid nginx 413
+        if (batch.length >= 10) {
+          await this.pushBatch(batch.splice(0));
           await this.yield();
-        } else {
-          const content = await this.vault.readText(file);
-          batch.push({ _id: docId, content, mtime: file.mtime });
-
-          // Flush in small chunks to avoid nginx 413
-          if (batch.length >= 10) {
-            await this.pushBatch(batch.splice(0));
-            await this.yield();
-          }
         }
       }
     }
