@@ -1890,6 +1890,149 @@ describe("SyncEngine", () => {
     });
   });
 
+  describe("reconcileLocalDeletes", () => {
+    function makeRevMapStore(revMap: Record<string, string>): TestStateStore {
+      const s = new TestStateStore();
+      s.set("vault-sync-revmap", JSON.stringify(revMap));
+      return s;
+    }
+
+    it("does not call bulkDocs for delete when all revMap files are present locally", async () => {
+      vault._addFile("notes/present.md", "content", 1000);
+
+      const store = makeRevMapStore({ "file/notes/present.md": "1-rev" });
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      // Remote returns same rev → no push/pull activity either
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/present.md", key: "file/notes/present.md", value: { rev: "1-rev" } }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      const deleteCalls = (client.bulkDocs.mock.calls as CouchDoc[][]).filter(
+        (args) => args[0]?.some?.((d: CouchDoc) => d._deleted)
+      );
+      expect(deleteCalls).toHaveLength(0);
+      eng.stop();
+    });
+
+    it("tombstones a locally-missing file via bulkDocs and cleans revMap", async () => {
+      // No file added to vault → locally absent
+
+      const store = makeRevMapStore({ "file/Mantu/missing.md": "1-old" });
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/Mantu/missing.md", rev: "2-tomb" }]);
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      expect(client.bulkDocs).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({ _id: "file/Mantu/missing.md", _deleted: true }),
+        ])
+      );
+
+      // revMap should be cleared for the tombstoned entry
+      const diagnostics = eng.getDiagnostics();
+      expect(diagnostics.revMapSize).toBe(0);
+      eng.stop();
+    });
+
+    it("falls back to per-doc delete when bulkDocs throws, cleans revMap on success", async () => {
+      const store = makeRevMapStore({ "file/notes/gone.md": "1-rev" });
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      // First bulkDocs call (reconcile) throws; delete succeeds
+      client.bulkDocs.mockRejectedValueOnce(new Error("network error"));
+      client.delete.mockResolvedValue({ ok: true, id: "file/notes/gone.md", rev: "2-tomb" });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      expect(client.delete).toHaveBeenCalledWith("file/notes/gone.md", "1-rev");
+      expect(eng.getDiagnostics().revMapSize).toBe(0);
+      eng.stop();
+    });
+
+    it("silently clears revMap when per-doc delete returns 404", async () => {
+      const { CouchError } = await import("./couch-client");
+
+      const store = makeRevMapStore({ "file/notes/already-gone.md": "1-rev" });
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.bulkDocs.mockRejectedValueOnce(new Error("bulk failed"));
+      client.delete.mockRejectedValue(new CouchError(404, '{"reason":"deleted"}'));
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      // No error should be emitted for 404
+      expect(errors).toHaveLength(0);
+      expect(eng.getDiagnostics().revMapSize).toBe(0);
+      eng.stop();
+    });
+
+    it("skips excluded paths in revMap — does not tombstone them", async () => {
+      // ".obsidian/" is in the default excludePatterns
+      const store = makeRevMapStore({ "file/.obsidian/config.json": "1-rev" });
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      const deleteCalls = (client.bulkDocs.mock.calls as CouchDoc[][]).filter(
+        (args) => args[0]?.some?.((d: CouchDoc) => d._deleted)
+      );
+      expect(deleteCalls).toHaveLength(0);
+      // revMap entry for excluded path should remain untouched
+      expect(eng.getDiagnostics().revMapSize).toBe(1);
+      eng.stop();
+    });
+
+    it("does not tombstone a file that is present locally even when rev is stale", async () => {
+      vault._addFile("notes/stale.md", "content", 1000);
+
+      const store = makeRevMapStore({ "file/notes/stale.md": "1-old" });
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      // Remote has a newer rev — pull would normally fetch this
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/stale.md", key: "file/notes/stale.md", value: { rev: "2-new" } }],
+      });
+      // Pull fetch returns a doc so pull can apply it
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/stale.md", key: "file/notes/stale.md", value: { rev: "2-new" }, doc: { _id: "file/notes/stale.md", _rev: "2-new", content: "updated", mtime: 2000 } }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "2", results: [] });
+
+      await eng.start();
+
+      // reconcile must NOT have sent a _deleted:true for this file
+      const deleteCalls = (client.bulkDocs.mock.calls as CouchDoc[][]).filter(
+        (args) => args[0]?.some?.((d: CouchDoc) => d._deleted)
+      );
+      expect(deleteCalls).toHaveLength(0);
+      eng.stop();
+    });
+  });
+
   describe("memory management", () => {
     it("stop() clears recentRemotePaths timers so they do not fire after stop", async () => {
       const client = getClient(engine);

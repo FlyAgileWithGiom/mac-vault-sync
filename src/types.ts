@@ -37,6 +37,7 @@ export interface CouchDoc {
   content: string | null;
   mtime: number;
   deleted?: boolean;
+  _deleted?: boolean;
   _attachments?: Record<string, CouchAttachmentStub>;
 }
 

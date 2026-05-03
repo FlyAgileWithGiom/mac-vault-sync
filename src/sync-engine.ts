@@ -249,6 +249,7 @@ export class SyncEngine {
         remoteRevs.set(row.id, row.value.rev);
       }
 
+      await this.reconcileLocalDeletes(remoteRevs);
       await this.pushAllLocal(remoteRevs);
       await this.pullAllRemote(remoteRevs);
       this.persistState();
@@ -256,6 +257,85 @@ export class SyncEngine {
     } catch (e) {
       this.setState("error");
       throw e;
+    }
+  }
+
+  /**
+   * Reconcile locally-deleted files that were missed while the daemon was down.
+   *
+   * The daemon propagates local deletes to CouchDB via chokidar `unlink` events.
+   * When the daemon is offline during a local delete, that event is lost and the
+   * remote doc becomes a ghost. This method detects those ghosts on every fullSync
+   * by comparing the persisted revMap (files the daemon last knew about) against
+   * the actual vault state. Anything in revMap that no longer exists locally (and
+   * is not excluded) gets tombstoned in bulk.
+   */
+  private async reconcileLocalDeletes(remoteRevs: Map<string, string>): Promise<void> {
+    const toDelete: { docId: string; rev: string }[] = [];
+
+    for (const docId of Object.keys(this.revMap)) {
+      const path = docIdToPath(docId);
+      const normalizedPath = this.normalizePath(path);
+      if (this.isExcluded(normalizedPath)) continue;
+      const entry = this.vault.getEntryByPath(normalizedPath);
+      if (entry !== null) continue; // File still present — nothing to do
+      toDelete.push({ docId, rev: this.revMap[docId] });
+    }
+
+    if (toDelete.length === 0) return;
+
+    console.log(`[vault-sync] reconcileLocalDeletes: tombstoning ${toDelete.length} locally-deleted docs`);
+
+    this.applyingRemote = true;
+    try {
+      const BATCH_SIZE = 50;
+      for (let i = 0; i < toDelete.length; i += BATCH_SIZE) {
+        const chunk = toDelete.slice(i, i + BATCH_SIZE);
+        const batch: CouchDoc[] = chunk.map(({ docId, rev }) => ({
+          _id: docId,
+          _rev: rev,
+          _deleted: true,
+          content: null,
+          mtime: 0,
+        }));
+
+        try {
+          const results = await this.client.bulkDocs(batch);
+          for (const result of results) {
+            if (result.ok) {
+              delete this.revMap[result.id];
+              remoteRevs.delete(result.id);
+            } else if (result.error) {
+              // Row-level error — skip silently, will retry next sync
+            }
+          }
+        } catch {
+          // Bulk threw — fall back to per-doc deletes (mirrors pushBatch lines 354-370)
+          for (const { docId, rev } of chunk) {
+            try {
+              const result = await this.client.delete(docId, rev);
+              if (result.ok) {
+                delete this.revMap[docId];
+                remoteRevs.delete(docId);
+              }
+            } catch (e) {
+              if (e instanceof CouchError && e.status === 404) {
+                // Already gone — clear local state (mirrors handleLocalDelete lines 836-838)
+                delete this.revMap[docId];
+                remoteRevs.delete(docId);
+              } else {
+                this.setError(`reconcileLocalDeletes: failed to delete ${docId}: ${(e as Error).message}`);
+              }
+            }
+          }
+        }
+
+        // Yield and persist state every batch (mirrors pullTextDocs lines 496-498)
+        await this.yield();
+        this.persistState();
+      }
+    } finally {
+      this.applyingRemote = false;
     }
   }
 
