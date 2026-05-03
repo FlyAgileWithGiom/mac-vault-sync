@@ -266,6 +266,19 @@ export class SyncEngine {
         if (knownRev === remoteRev) continue; // Already synced
         continue; // Rev unknown or changed - pull will handle
       } else {
+        // File not in remote allDocs — check for tombstone before pushing
+        try {
+          const remote = await this.client.get(docId);
+          if (remote.deleted) {
+            // Server has a tombstone — do not resurrect; delete locally
+            await this.handleRemoteDelete(docId);
+            continue;
+          }
+          // Doc exists with content but wasn't in allDocs index (edge case); let pull handle it
+        } catch {
+          // 404 or network error: treat as genuinely new, fall through to push
+        }
+
         // New file, not on remote
         if (this.isBinaryDoc(docId)) {
           // Binary files need attachment PUT, not bulk_docs

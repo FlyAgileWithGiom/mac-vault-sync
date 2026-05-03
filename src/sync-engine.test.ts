@@ -335,6 +335,39 @@ describe("SyncEngine", () => {
       // Should not push (doc already exists remotely)
       expect(client.bulkDocs).not.toHaveBeenCalled();
     });
+
+    it("does not resurrect a file that was deleted on the server when syncing with empty revMap", async () => {
+      // Simulates a fresh install (empty revMap) where the file exists locally
+      // but was deleted on the server (tombstone present)
+      vault._addFile("notes/deleted-on-server.md", "local content", 1000);
+
+      const client = getClient(engine);
+      // allDocs returns [] — the file is not there (deleted on server, tombstone not in allDocs)
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      // GET for the doc returns a tombstone (deleted: true)
+      client.get.mockResolvedValue({
+        _id: "file/notes/deleted-on-server.md",
+        _rev: "3-abc",
+        deleted: true,
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      // Should NOT push the file back (resurrection bug)
+      const putCalls = client.put.mock.calls as Array<[{ _id: string }]>;
+      const resurrectionAttempt = putCalls.some(
+        ([doc]) => doc._id === "file/notes/deleted-on-server.md"
+      );
+      expect(resurrectionAttempt).toBe(false);
+      expect(client.bulkDocs).not.toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({ _id: "file/notes/deleted-on-server.md" }),
+        ])
+      );
+      // File should be deleted locally
+      expect(vault.getAbstractFileByPath("notes/deleted-on-server.md")).toBeNull();
+    });
   });
 
   describe("fullSync - pull", () => {
