@@ -94,9 +94,11 @@ def load_config(vault: str) -> dict:
 # ---------------------------------------------------------------------------
 
 DEFAULT_EXCLUDE = [".trash/", ".obsidian/", ".vault-sync-state.json", ".vault-sync.json", ".DS_Store"]
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB — must match sync-engine.ts MAX_FILE_SIZE
 
 
 def list_fs_files(vault: str, exclude_patterns: list[str]) -> list[str]:
+    """Return paths of files that the daemon could sync (size ≤ MAX_FILE_SIZE)."""
     result = []
     for dirpath, dirnames, filenames in os.walk(vault):
         # Prune excluded dirs in-place
@@ -110,6 +112,28 @@ def list_fs_files(vault: str, exclude_patterns: list[str]) -> list[str]:
             if not any(pat.rstrip("/") in rel for pat in exclude_patterns):
                 result.append(rel)
     return sorted(result)
+
+
+def list_oversize_files(vault: str, exclude_patterns: list[str]) -> list[tuple[str, int]]:
+    """Return paths and sizes of files exceeding MAX_FILE_SIZE — silently skipped by daemon."""
+    result = []
+    for dirpath, dirnames, filenames in os.walk(vault):
+        dirnames[:] = [
+            d for d in dirnames
+            if not any((d + "/") in p or d == p.rstrip("/") for p in exclude_patterns)
+            and not d.startswith(".")
+        ]
+        for fname in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, fname), vault)
+            if any(pat.rstrip("/") in rel for pat in exclude_patterns):
+                continue
+            try:
+                size = os.path.getsize(os.path.join(dirpath, fname))
+                if size > MAX_FILE_SIZE:
+                    result.append((rel, size))
+            except OSError:
+                pass
+    return sorted(result, key=lambda x: -x[1])
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +217,11 @@ def print_report(vault: str) -> None:
     all_revmap_ids = known_ids | tombstoned_ids | orphan_ids
 
     fs_files = list_fs_files(vault, exclude_patterns)
+    oversize_files = list_oversize_files(vault, exclude_patterns)
     # NFC-normalize FS ids so comparison with DB (which stores NFC) is accurate
     # on macOS where filenames are stored in NFD on disk.
     fs_ids = {nfc(f"file/{p}") for p in fs_files}
+    oversize_ids = {nfc(f"file/{p}") for p, _ in oversize_files}
 
     db_result = query_db(config)
     db_rows = db_result.get("rows", [])
@@ -209,8 +235,10 @@ def print_report(vault: str) -> None:
     orphan_ids = {nfc(k) for k in orphan_ids}
     all_revmap_ids = known_ids | tombstoned_ids | orphan_ids
 
-    # Divergence
-    fs_only = sorted(fs_ids - db_doc_ids)
+    # Divergence — separate "oversize unsyncable" (>10MB cap) from real "FS-only push pending"
+    fs_only_all = fs_ids - db_doc_ids
+    fs_only_oversize = sorted(fs_only_all & oversize_ids)
+    fs_only = sorted(fs_only_all - oversize_ids)
     db_only_all = db_doc_ids - fs_ids
     db_only_agent = sorted(db_only_all & (known_ids | orphan_ids))  # in revMap but not tombstoned
     db_only_true_orphan = sorted(db_only_all - all_revmap_ids)     # not in revMap at all
@@ -253,7 +281,16 @@ def print_report(vault: str) -> None:
             if len(items) > TOP_N:
                 print(f"    ... and {len(items) - TOP_N} more")
 
-        show("FS-only (push pending)", fs_only)
+        show("FS-only (push pending, ≤10MB)", fs_only)
+        if fs_only_oversize:
+            print(f"  FS-only OVERSIZE >10MB (silently skipped — issue #6 chunked upload): {len(fs_only_oversize)}")
+            # Build size lookup for display
+            size_by_id = {nfc(f"file/{p}"): sz for p, sz in oversize_files}
+            for p in fs_only_oversize[:TOP_N]:
+                size = size_by_id.get(p, 0)
+                print(f"    {size / 1024 / 1024:.1f}MB  {p.removeprefix('file/')}")
+            if len(fs_only_oversize) > TOP_N:
+                print(f"    ... and {len(fs_only_oversize) - TOP_N} more")
         show("DB-only orphans (agent-created, no FS)", db_only_agent)
         show("DB-only NOT in revMap (true orphans)", db_only_true_orphan)
         show("Tombstoned but FS file exists (resurrection candidate!)", resurrection)
