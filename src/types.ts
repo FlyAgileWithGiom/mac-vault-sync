@@ -103,6 +103,10 @@ export interface SyncDiagnostics {
   pullApplied: number;
   pendingPushCount: number;
   lastError: string | null;
+  /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT) */
+  unsyncableCount: number;
+  /** Up to 5 paths of currently unsyncable files, for diagnostics UI */
+  unsyncableSample: string[];
 }
 
 // --- Portable abstractions (used by both Obsidian plugin and headless daemon) ---

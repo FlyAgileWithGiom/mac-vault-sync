@@ -2681,6 +2681,212 @@ describe("SyncEngine", () => {
   });
 });
 
+describe("robust read errors", () => {
+  let vault: Vault;
+  let stateStore: TestStateStore;
+  let settings: VaultSyncSettings;
+  let errors: string[];
+
+  function makeEngine(vaultAdapter: VaultAdapter): SyncEngine {
+    const e = new SyncEngine(settings, vaultAdapter, stateStore, noopTransport);
+    e.onError = (msg) => errors.push(msg);
+    return e;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vault = new Vault();
+    stateStore = new TestStateStore();
+    settings = makeSettings();
+    errors = [];
+  });
+
+  it("EAGAIN on readBinary: file added to unsyncableFiles, push continues for other files", async () => {
+    // Set up two binary files: one triggers EAGAIN, the other pushes successfully
+    vault._addFile("images/cloud.png", "png-data", 2000);
+    vault._addFile("images/local.png", "png-data2", 2001);
+
+    const eagainError = Object.assign(new Error("Unknown system error -11"), { code: "EAGAIN" });
+
+    const adapter = new TestVaultAdapter(vault);
+    const origReadBinary = adapter.readBinary.bind(adapter);
+    adapter.readBinary = async (file: VaultFile) => {
+      if (file.path === "images/cloud.png") throw eagainError;
+      return origReadBinary(file);
+    };
+
+    const engine = makeEngine(adapter);
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+    client.putAttachment.mockResolvedValue({ ok: true, id: "file/images/local.png", rev: "1-abc" });
+    client.put.mockResolvedValue({ ok: true, id: "file/images/local.png", rev: "1-abc" });
+
+    await engine.start();
+
+    const diag = engine.getDiagnostics();
+    expect(diag.unsyncableCount).toBe(1);
+    expect(diag.unsyncableSample).toContain("images/cloud.png");
+    // The other file was pushed — putAttachment called at least once
+    expect(client.putAttachment).toHaveBeenCalled();
+    // No per-file error for the EAGAIN — only the summary once-per-fullSync error
+    expect(errors.some((e) => e.includes("unsyncable"))).toBe(true);
+    expect(errors.every((e) => !e.includes("Binary push failed"))).toBe(true);
+
+    engine.stop();
+  });
+
+  it("EACCES on readText: file added to unsyncableFiles, push continues for other files", async () => {
+    vault._addFile("docs/restricted.md", "secret", 2000);
+    vault._addFile("docs/open.md", "hello", 2001);
+
+    const eaccesError = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+
+    const adapter = new TestVaultAdapter(vault);
+    const origReadText = adapter.readText.bind(adapter);
+    adapter.readText = async (file: VaultFile) => {
+      if (file.path === "docs/restricted.md") throw eaccesError;
+      return origReadText(file);
+    };
+
+    const engine = makeEngine(adapter);
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+    client.bulkDocs.mockResolvedValue([
+      { ok: true, id: "file/docs/open.md", rev: "1-x" },
+    ]);
+
+    await engine.start();
+
+    const diag = engine.getDiagnostics();
+    expect(diag.unsyncableCount).toBe(1);
+    expect(diag.unsyncableSample).toContain("docs/restricted.md");
+    expect(errors.some((e) => e.includes("unsyncable"))).toBe(true);
+    expect(errors.every((e) => !e.includes("Push failed for"))).toBe(true);
+
+    engine.stop();
+  });
+
+  it("ENOENT on readBinary (race-deleted): file added to unsyncableFiles", async () => {
+    vault._addFile("images/vanish.png", "data", 2000);
+
+    const enoentError = Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+
+    const adapter = new TestVaultAdapter(vault);
+    adapter.readBinary = async (_file: VaultFile) => { throw enoentError; };
+
+    const engine = makeEngine(adapter);
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+    await engine.start();
+
+    const diag = engine.getDiagnostics();
+    expect(diag.unsyncableCount).toBe(1);
+    expect(diag.unsyncableSample).toContain("images/vanish.png");
+
+    engine.stop();
+  });
+
+  it("EBUSY (non-recoverable): error propagates as fatal binary push failure", async () => {
+    vault._addFile("images/busy.png", "data", 2000);
+
+    const ebusyError = Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
+
+    const adapter = new TestVaultAdapter(vault);
+    adapter.readBinary = async (_file: VaultFile) => { throw ebusyError; };
+
+    const engine = makeEngine(adapter);
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+    await engine.start();
+
+    // EBUSY is not recoverable — logged as a push failure error (not as unsyncable)
+    expect(errors.some((e) => e.includes("Binary push failed"))).toBe(true);
+    const diag = engine.getDiagnostics();
+    expect(diag.unsyncableCount).toBe(0);
+
+    engine.stop();
+  });
+
+  it("successful read after previous EAGAIN removes file from unsyncableFiles", async () => {
+    vault._addFile("images/cloud.png", "png-data", 2000);
+
+    let callCount = 0;
+    const eagainError = Object.assign(new Error("Unknown system error -11"), { code: "EAGAIN" });
+
+    const adapter = new TestVaultAdapter(vault);
+    const origReadBinary = adapter.readBinary.bind(adapter);
+    adapter.readBinary = async (file: VaultFile) => {
+      callCount++;
+      if (callCount === 1) throw eagainError; // First call: EAGAIN
+      return origReadBinary(file);             // Subsequent calls: success
+    };
+
+    const engine = makeEngine(adapter);
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+    client.put.mockResolvedValue({ ok: true, id: "file/images/cloud.png", rev: "1-a" });
+    client.putAttachment.mockResolvedValue({ ok: true, id: "file/images/cloud.png", rev: "2-b" });
+
+    await engine.start();
+
+    // After first fullSync: file is unsyncable
+    expect(engine.getDiagnostics().unsyncableCount).toBe(1);
+    engine.stop();
+
+    // Simulate a second fullSync cycle — reset mocks for it
+    vi.clearAllMocks();
+    const engine2 = new SyncEngine(settings, adapter, stateStore, noopTransport);
+    engine2.onError = (msg) => errors.push(msg);
+    const client2 = getClient(engine2);
+    client2.allDocs.mockResolvedValue({ total_rows: 0, rows: [{ id: "file/images/cloud.png", key: "file/images/cloud.png", value: { rev: "1-a" } }] });
+    client2.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client2.changes.mockResolvedValue({ last_seq: "0", results: [] });
+    client2.put.mockResolvedValue({ ok: true, id: "file/images/cloud.png", rev: "2-b" });
+    client2.putAttachment.mockResolvedValue({ ok: true, id: "file/images/cloud.png", rev: "2-b" });
+
+    await engine2.start();
+    expect(engine2.getDiagnostics().unsyncableCount).toBe(0);
+    engine2.stop();
+  });
+
+  it("getDiagnostics unsyncableCount reflects map size", async () => {
+    vault._addFile("a.png", "a", 1000);
+    vault._addFile("b.png", "b", 1001);
+    vault._addFile("c.png", "c", 1002);
+
+    const recoverable = Object.assign(new Error("Unknown system error -11"), { code: "EAGAIN" });
+
+    const adapter = new TestVaultAdapter(vault);
+    adapter.readBinary = async (_file: VaultFile) => { throw recoverable; };
+
+    const engine = makeEngine(adapter);
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+    await engine.start();
+
+    const diag = engine.getDiagnostics();
+    expect(diag.unsyncableCount).toBe(3);
+    expect(diag.unsyncableSample.length).toBeLessThanOrEqual(5);
+
+    engine.stop();
+  });
+});
+
 describe("lwwWinner", () => {
   it("returns local when mtimes are equal (already have it, no need to fetch)", () => {
     expect(lwwWinner(1000, 1000)).toBe("local");

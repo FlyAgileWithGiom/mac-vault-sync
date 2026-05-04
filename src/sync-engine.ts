@@ -137,6 +137,37 @@ function isTombstone404(e: unknown): boolean {
 }
 
 /**
+ * Recoverable error codes for file reads. These errors mean the file is
+ * temporarily inaccessible (cloud-only, permission issue, transient I/O, or
+ * race-deleted) and the daemon should skip the file rather than crash the sync.
+ *
+ * EAGAIN (-11): Dropbox/iCloud Smart Sync — file not yet downloaded to disk.
+ * EACCES (-13): Permission denied.
+ * EIO   (-5):   Transient disk/network I/O error.
+ * ENOENT (-2):  File disappeared between scan and read (rm race).
+ */
+const RECOVERABLE_READ_CODES = new Set(["EAGAIN", "EACCES", "EIO", "ENOENT"]);
+
+function isRecoverableReadError(e: unknown): { recoverable: boolean; code?: string } {
+  if (e instanceof Error) {
+    const err = e as NodeJS.ErrnoException;
+    if (typeof err.code === "string" && RECOVERABLE_READ_CODES.has(err.code)) {
+      return { recoverable: true, code: err.code };
+    }
+    // Match generic "Unknown system error -N" messages (node fallback for unknown errno values)
+    const match = err.message?.match(/system error (-\d+)/);
+    if (match) {
+      const errno = match[1];
+      // -11=EAGAIN, -13=EACCES, -5=EIO, -2=ENOENT
+      if (errno === "-11" || errno === "-13" || errno === "-5" || errno === "-2") {
+        return { recoverable: true, code: `errno${errno}` };
+      }
+    }
+  }
+  return { recoverable: false };
+}
+
+/**
  * Bidirectional sync engine between a vault and CouchDB.
  *
  * Design decisions for mobile-first:
@@ -163,6 +194,8 @@ export class SyncEngine {
   private pullApplied = 0;
   private lastError: string | null = null;
   private currentState: SyncState = "idle";
+  /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT). Cleared on successful read. */
+  private unsyncableFiles: Map<string, { reason: string; firstSeen: number; retryAfter: number }> = new Map();
 
   /** Callback to update UI state */
   onStateChange: (state: SyncState) => void = () => {};
@@ -209,6 +242,8 @@ export class SyncEngine {
       pullApplied: this.pullApplied,
       pendingPushCount: this.pendingWrites.size,
       lastError: this.lastError,
+      unsyncableCount: this.unsyncableFiles.size,
+      unsyncableSample: [...this.unsyncableFiles.keys()].slice(0, 5),
     };
   }
 
@@ -354,6 +389,17 @@ export class SyncEngine {
       await this.pushAllLocal(remoteRevs);
       await this.pullAllRemote(remoteRevs, opts);
       this.persistState();
+
+      // Surface unsyncable files once per fullSync (not per file) to avoid error noise.
+      // Files remain in the map for the next cycle — Dropbox/iCloud may have downloaded by then.
+      if (this.unsyncableFiles.size > 0) {
+        this.setError(`${this.unsyncableFiles.size} unsyncable files (e.g. cloud-only): see diagnostics`);
+        console.warn("[vault-sync] Unsyncable files (top 5):");
+        for (const [path, info] of [...this.unsyncableFiles].slice(0, 5)) {
+          console.warn(`  ${path} → ${info.reason} (since ${new Date(info.firstSeen).toISOString()})`);
+        }
+      }
+
       this.setState("ok");
     } catch (e) {
       this.setState("error");
@@ -530,7 +576,25 @@ export class SyncEngine {
         await this.pushBinaryFile(file);
         await this.yield();
       } else {
-        const content = await this.vault.readText(file);
+        let content: string;
+        try {
+          content = await this.vault.readText(file);
+          // Successful read: remove from unsyncable set (file is accessible again)
+          this.unsyncableFiles.delete(file.path);
+        } catch (e) {
+          const check = isRecoverableReadError(e);
+          if (check.recoverable) {
+            this.unsyncableFiles.set(file.path, {
+              reason: check.code ?? "unknown",
+              firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
+              retryAfter: Date.now() + 60_000,
+            });
+            await this.yield();
+            continue; // Skip this file, continue rest of sync
+          }
+          throw e; // Non-recoverable: propagate
+        }
+
         batch.push({ _id: docId, content, mtime: file.mtime });
 
         // Flush in small chunks to avoid nginx 413
@@ -1155,7 +1219,24 @@ export class SyncEngine {
         return;
       }
 
-      const content = await this.vault.readText(file);
+      let content: string;
+      try {
+        content = await this.vault.readText(file);
+        // Successful read: remove from unsyncable set (file is accessible again)
+        this.unsyncableFiles.delete(file.path);
+      } catch (e) {
+        const check = isRecoverableReadError(e);
+        if (check.recoverable) {
+          this.unsyncableFiles.set(file.path, {
+            reason: check.code ?? "unknown",
+            firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
+            retryAfter: Date.now() + 60_000,
+          });
+          return; // Skip this file, continue rest of sync
+        }
+        throw e; // Non-recoverable: propagate
+      }
+
       const doc: CouchDoc = {
         _id: docId,
         content,
@@ -1209,7 +1290,24 @@ export class SyncEngine {
         return;
       }
 
-      const data = await this.vault.readBinary(file);
+      let data: ArrayBuffer;
+      try {
+        data = await this.vault.readBinary(file);
+        // Successful read: remove from unsyncable set (file is accessible again)
+        this.unsyncableFiles.delete(file.path);
+      } catch (e) {
+        const check = isRecoverableReadError(e);
+        if (check.recoverable) {
+          this.unsyncableFiles.set(file.path, {
+            reason: check.code ?? "unknown",
+            firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
+            retryAfter: Date.now() + 60_000,
+          });
+          return; // Skip this file, continue rest of sync
+        }
+        throw e; // Non-recoverable: propagate
+      }
+
       const contentType = contentTypeForPath(file.path);
 
       // Ensure the stub doc exists first (needed for the attachment PUT).
