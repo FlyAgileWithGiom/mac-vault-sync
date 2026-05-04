@@ -4,6 +4,7 @@ import type {
   CouchDoc,
   CouchChangeRow,
   RevMap,
+  RevMapEntry,
   SyncState,
   SyncCounts,
   SyncDiagnostics,
@@ -165,7 +166,17 @@ export class SyncEngine {
   private loadPersistedState(): void {
     try {
       const stored = this.store.get(REVMAP_KEY);
-      if (stored) this.revMap = JSON.parse(stored);
+      if (stored) {
+        const raw = JSON.parse(stored) as Record<string, RevMapEntry | string>;
+        // Migrate legacy string-valued entries (old format: { docId: revString })
+        // to the new RevMapEntry shape. mtime:0 means "unknown, treat as changed" for Trou A.
+        // Expected one-time burst on first run after migration: 409→resolveConflict handles
+        // redundant pushes when file content is identical.
+        for (const [id, val] of Object.entries(raw)) {
+          if (typeof val === "string") raw[id] = { rev: val, mtime: 0, lastSeenInFs: 0 };
+        }
+        this.revMap = raw as RevMap;
+      }
       const seq = this.store.get(SEQ_KEY);
       if (seq) this.lastSeq = JSON.parse(seq);
     } catch {
@@ -241,10 +252,12 @@ export class SyncEngine {
 
   async forceFullSync(): Promise<void> {
     this.clearState();
-    await this.fullSync();
+    // bypassOrphanGuard: true — empty revMap after clearState() must not skip all pulls.
+    // Bypass is for seed/restore; in normal operation the guard remains active.
+    await this.fullSync({ bypassOrphanGuard: true });
   }
 
-  async fullSync(): Promise<void> {
+  async fullSync(opts: { bypassOrphanGuard?: boolean } = {}): Promise<void> {
     this.setState("syncing");
     try {
       // Fetch remote rev index (no content) -- lightweight, ~15K rows with just id+rev
@@ -259,7 +272,7 @@ export class SyncEngine {
 
       await this.reconcileLocalDeletes(remoteRevs);
       await this.pushAllLocal(remoteRevs);
-      await this.pullAllRemote(remoteRevs);
+      await this.pullAllRemote(remoteRevs, opts);
       this.persistState();
       this.setState("ok");
     } catch (e) {
@@ -287,7 +300,7 @@ export class SyncEngine {
       if (this.isExcluded(normalizedPath)) continue;
       const entry = this.vault.getEntryByPath(normalizedPath);
       if (entry !== null) continue; // File still present — nothing to do
-      toDelete.push({ docId, rev: this.revMap[docId] });
+      toDelete.push({ docId, rev: this.revMap[docId].rev });
     }
 
     if (toDelete.length === 0) return;
@@ -389,7 +402,21 @@ export class SyncEngine {
       if (fi % 100 === 99) await this.yield();
 
       if (remoteRevs.has(docId)) {
-        // Doc exists remotely - let pull handle content comparison
+        // Trou A fix: skip push only when file has not changed since last sync.
+        // mtime:0 means migration default (unknown mtime) — treat as changed → push.
+        const known = this.revMap[docId];
+        if (known && known.mtime > 0 && file.mtime <= known.mtime) {
+          continue; // Not changed since last sync
+        }
+        // Fall through: file modified (or mtime unknown after migration) → push it.
+        // For changed files, delegate to pushTextFile/pushBinaryFile which handle rev correctly.
+        if (this.isBinaryDoc(docId)) {
+          await this.pushBinaryFile(file);
+          await this.yield();
+        } else {
+          await this.pushTextFile(file);
+          await this.yield();
+        }
         continue;
       }
 
@@ -431,7 +458,8 @@ export class SyncEngine {
       const results = await this.client.bulkDocs(batch);
       for (const result of results) {
         if (result.ok && result.rev) {
-          this.revMap[result.id] = result.rev;
+          const localDoc = batch.find((d) => d._id === result.id);
+          this.revMap[result.id] = { rev: result.rev, mtime: localDoc?.mtime ?? 0, lastSeenInFs: Date.now() };
         } else if (result.error === "conflict") {
           const localDoc = batch.find((d) => d._id === result.id);
           if (localDoc) {
@@ -446,7 +474,7 @@ export class SyncEngine {
         try {
           const result = await this.client.put(doc);
           if (result.ok && result.rev) {
-            this.revMap[result.id] = result.rev;
+            this.revMap[result.id] = { rev: result.rev, mtime: doc.mtime ?? 0, lastSeenInFs: Date.now() };
           }
         } catch (putErr) {
           if (putErr instanceof CouchError && putErr.status === 409) {
@@ -484,13 +512,17 @@ export class SyncEngine {
     return SyncEngine.BINARY_EXTENSIONS.has(ext);
   }
 
-  private async pullAllRemote(remoteRevs: Map<string, string>): Promise<void> {
+  private async pullAllRemote(remoteRevs: Map<string, string>, opts: { bypassOrphanGuard?: boolean } = {}): Promise<void> {
     const textToPull: string[] = [];
     const binaryToPull: string[] = [];
 
     for (const [docId, rev] of remoteRevs) {
       if (docId.startsWith("_design/")) continue;
-      if (this.revMap[docId] === rev) continue;
+      if (this.revMap[docId]?.rev === rev) continue;
+      // Trou B: doc exists in DB but has no revMap entry → agent-created doc, skip pull.
+      // Without a revMap entry we have no evidence this device ever synced this doc to FS.
+      // First-device onboarding (empty state): seed via rsync or forceFullSync({ bypassOrphanGuard: true }).
+      if (!this.revMap[docId] && !opts.bypassOrphanGuard) continue;
       if (this.isBinaryDoc(docId)) {
         binaryToPull.push(docId);
       } else {
@@ -565,7 +597,7 @@ export class SyncEngine {
           try {
             await this.applyRemoteDoc(doc);
             if (doc._rev) {
-              this.revMap[doc._id] = doc._rev;
+              this.revMap[doc._id] = { rev: doc._rev, mtime: doc.mtime ?? 0, lastSeenInFs: Date.now() };
               this.pullApplied++;
             }
           } catch (e) {
@@ -614,9 +646,10 @@ export class SyncEngine {
     const toDownload: string[] = [];
     for (const docId of docIds) {
       if (!hasAttachment.has(docId)) {
-        // Orphan: record rev so we don't re-fetch on next sync
+        // Orphan: record rev so we don't re-fetch on next sync.
+        // mtime:0 and lastSeenInFs:0 because no FS file was written.
         const rev = remoteRevs.get(docId);
-        if (rev) this.revMap[docId] = rev;
+        if (rev) this.revMap[docId] = { rev, mtime: 0, lastSeenInFs: 0 };
         this.pullSkipped++;
         this.pullFetched++;
         this.pullCount--;
@@ -655,7 +688,9 @@ export class SyncEngine {
           const { docId, data } = result.value;
           await this.applyRemoteBinary(docId, data);
           const rev = remoteRevs.get(docId);
-          if (rev) this.revMap[docId] = rev;
+          // mtime not easily available here (binary doc metadata not fetched with content);
+          // use 0 as placeholder. lastSeenInFs set because file was written to FS.
+          if (rev) this.revMap[docId] = { rev, mtime: 0, lastSeenInFs: Date.now() };
           this.pullApplied++;
         } else {
           const docId = batch[j];
@@ -764,18 +799,32 @@ export class SyncEngine {
 
         if (change.deleted) {
           await this.handleRemoteDelete(change.id);
-        } else if (change.doc) {
-          if (this.isBinaryDoc(change.id)) {
-            const data = await this.client.getAttachment(change.id, ATTACHMENT_NAME, BINARY_PULL_TIMEOUT_MS);
-            await this.applyRemoteBinary(change.id, data);
-          } else {
-            await this.applyRemoteDoc(change.doc);
+        } else {
+          // Trou B guard for incremental sync: skip agent-created docs (no revMap entry).
+          // This mirrors the pullAllRemote guard and prevents writing arbitrary DB content to FS.
+          if (!this.revMap[change.id]) {
+            this.pullCount--;
+            this.emitCounts();
+            continue;
+          }
+          if (change.doc) {
+            if (this.isBinaryDoc(change.id)) {
+              const data = await this.client.getAttachment(change.id, ATTACHMENT_NAME, BINARY_PULL_TIMEOUT_MS);
+              await this.applyRemoteBinary(change.id, data);
+            } else {
+              await this.applyRemoteDoc(change.doc);
+            }
           }
         }
 
         // Update rev map
         if (change.changes.length > 0) {
-          this.revMap[change.id] = change.changes[0].rev;
+          const existing = this.revMap[change.id];
+          this.revMap[change.id] = {
+            rev: change.changes[0].rev,
+            mtime: change.doc?.mtime ?? existing?.mtime ?? 0,
+            lastSeenInFs: change.deleted ? (existing?.lastSeenInFs ?? 0) : Date.now(),
+          };
         }
         this.pullCount--;
         this.emitCounts();
@@ -910,7 +959,8 @@ export class SyncEngine {
     if (this.isExcluded(file.path)) return;
 
     const docId = pathToDocId(file.path);
-    const rev = this.revMap[docId];
+    const entry = this.revMap[docId];
+    const rev = entry?.rev;
     console.log(`[vault-sync] Delete: ${file.path} docId=${docId} rev=${rev ?? "NONE"}`);
     if (!rev) return; // Never synced, nothing to do
 
@@ -937,7 +987,7 @@ export class SyncEngine {
 
     // Delete old doc
     const oldDocId = pathToDocId(oldPath);
-    const oldRev = this.revMap[oldDocId];
+    const oldRev = this.revMap[oldDocId]?.rev;
     if (oldRev) {
       try {
         await this.client.delete(oldDocId, oldRev);
@@ -984,9 +1034,11 @@ export class SyncEngine {
         mtime: file.mtime,
       };
 
-      // Include rev if we have one (update) or fetch it (avoid conflict)
+      // Always pass _rev when we have a revMap entry — avoids 409 storm after migration
+      // (mtime:0 entries still have the correct rev from the legacy string value).
+      // If no revMap entry, fetch the current rev to avoid a blind conflict.
       if (this.revMap[docId]) {
-        doc._rev = this.revMap[docId];
+        doc._rev = this.revMap[docId].rev;
       } else {
         try {
           const remote = await this.client.get(docId);
@@ -999,7 +1051,7 @@ export class SyncEngine {
       try {
         const result = await this.client.put(doc);
         if (result.ok && result.rev) {
-          this.revMap[docId] = result.rev;
+          this.revMap[docId] = { rev: result.rev, mtime: file.mtime, lastSeenInFs: Date.now() };
           this.persistState();
         }
       } catch (e) {
@@ -1020,8 +1072,9 @@ export class SyncEngine {
       const data = await this.vault.readBinary(file);
       const contentType = contentTypeForPath(file.path);
 
-      // Ensure the stub doc exists first (needed for the attachment PUT)
-      let rev = this.revMap[docId];
+      // Ensure the stub doc exists first (needed for the attachment PUT).
+      // Always pass _rev when we have a revMap entry — avoids 409 storm after migration.
+      let rev = this.revMap[docId]?.rev ?? "";
       if (!rev) {
         try {
           const remote = await this.client.get(docId);
@@ -1035,7 +1088,7 @@ export class SyncEngine {
           // Doc not found (missing, not deleted) — create stub doc
           const stubResult = await this.client.put({ _id: docId, content: null, mtime: file.mtime });
           rev = stubResult.rev ?? "";
-          if (stubResult.rev) this.revMap[docId] = stubResult.rev;
+          if (stubResult.rev) this.revMap[docId] = { rev: stubResult.rev, mtime: file.mtime, lastSeenInFs: Date.now() };
         }
       }
 
@@ -1045,7 +1098,7 @@ export class SyncEngine {
         try {
           const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType);
           if (result.ok && result.rev) {
-            this.revMap[docId] = result.rev;
+            this.revMap[docId] = { rev: result.rev, mtime: file.mtime, lastSeenInFs: Date.now() };
             this.persistState();
           }
           break;
@@ -1058,7 +1111,7 @@ export class SyncEngine {
             // Rev became stale between stub PUT and attachment PUT — refetch and retry
             const fresh = await this.client.get(docId);
             attachmentRev = fresh._rev ?? "";
-            this.revMap[docId] = attachmentRev;
+            this.revMap[docId] = { rev: attachmentRev, mtime: this.revMap[docId]?.mtime ?? 0, lastSeenInFs: this.revMap[docId]?.lastSeenInFs ?? 0 };
           } else {
             throw e;
           }
@@ -1083,7 +1136,9 @@ export class SyncEngine {
     const MAX_RETRIES = 3;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       const remote = await this.client.get(docId);
-      this.revMap[docId] = remote._rev!;
+      // Preserve existing mtime/lastSeenInFs on initial fetch (rev updated after resolution)
+      const existing = this.revMap[docId];
+      this.revMap[docId] = { rev: remote._rev!, mtime: remote.mtime ?? existing?.mtime ?? 0, lastSeenInFs: existing?.lastSeenInFs ?? 0 };
 
       if (remote.content === localContent) {
         // Same content, no real conflict - just update rev
@@ -1102,7 +1157,7 @@ export class SyncEngine {
         try {
           const result = await this.client.put(doc);
           if (result.ok && result.rev) {
-            this.revMap[docId] = result.rev;
+            this.revMap[docId] = { rev: result.rev, mtime: localMtime, lastSeenInFs: Date.now() };
           }
           this.persistState();
           return;

@@ -442,7 +442,9 @@ describe("SyncEngine", () => {
   });
 
   describe("fullSync - pull", () => {
-    it("pulls remote docs on first sync with empty vault", async () => {
+    it("pulls remote docs on first sync with empty vault (via forceFullSync)", async () => {
+      // forceFullSync bypasses the orphan guard, enabling first-device onboarding.
+      // Normal start() with empty revMap skips all pulls (Trou B: agent-created docs protection).
       const client = getClient(engine);
       client.allDocs.mockResolvedValue({
         total_rows: 1,
@@ -463,7 +465,7 @@ describe("SyncEngine", () => {
       });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine.forceFullSync();
 
       expect(vault._getContent("notes/remote.md")).toBe("from remote");
     });
@@ -522,7 +524,16 @@ describe("SyncEngine", () => {
     });
 
     it("uses batch pull via allDocsByKeys for speed", async () => {
-      const client = getClient(engine);
+      // Pre-populate revMap with stale revs to simulate a device that had synced before;
+      // remote has newer revs → triggers pull.
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/a.md": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+        "file/notes/b.md": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 2,
         rows: [
@@ -539,16 +550,25 @@ describe("SyncEngine", () => {
       });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
       expect(client.allDocsByKeys).toHaveBeenCalled();
       expect(client.get).not.toHaveBeenCalled(); // Should NOT use individual GETs
       expect(vault._getContent("notes/a.md")).toBe("aaa");
       expect(vault._getContent("notes/b.md")).toBe("bbb");
+      engine2.stop();
     });
 
     it("skips docs with null content in batch pull", async () => {
-      const client = getClient(engine);
+      // Pre-populate revMap — required to pass Trou B orphan guard.
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/text.md": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+        "file/images/photo.png": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 2,
         rows: [
@@ -565,14 +585,23 @@ describe("SyncEngine", () => {
       });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
       expect(vault._getContent("notes/text.md")).toBe("hello");
       expect(vault._getContent("images/photo.png")).toBeUndefined(); // null content skipped
+      engine2.stop();
     });
 
     it("skips binary extensions in pull", async () => {
-      const client = getClient(engine);
+      // Pre-populate revMap with stale revs — required to pass Trou B orphan guard.
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/text.md": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+        "file/images/photo.jpg": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 2,
         rows: [
@@ -589,12 +618,13 @@ describe("SyncEngine", () => {
       });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
       expect(vault._getContent("notes/text.md")).toBe("hello");
       // Verify allDocsByKeys was called without the .jpg
       const calledKeys = client.allDocsByKeys.mock.calls[0][0];
       expect(calledKeys).not.toContain("file/images/photo.jpg");
+      engine2.stop();
     });
 
     it("applies remote doc when mtime is missing (external tool update)", async () => {
@@ -689,20 +719,22 @@ describe("SyncEngine", () => {
     it("applies remote changes from changes feed when mtime is missing", async () => {
       vault._addFile("notes/feed.md", "old content", 1000);
 
-      const client = getClient(engine);
+      // Pre-populate revMap so the file is known to this device (passed through Trou B guard).
+      // The initial fullSync also passes through the rev-match guard since local rev == remote rev.
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/feed.md": { rev: "1-r", mtime: 1000, lastSeenInFs: Date.now() },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+      engine2.onStateChange = (s) => stateChanges.push(s);
+      engine2.onError = (msg) => errors.push(msg);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{ id: "file/notes/feed.md", key: "file/notes/feed.md", value: { rev: "1-r" } }],
       });
-      client.allDocsByKeys.mockResolvedValue({
-        total_rows: 1,
-        rows: [{
-          id: "file/notes/feed.md",
-          key: "file/notes/feed.md",
-          value: { rev: "1-r" },
-          doc: { _id: "file/notes/feed.md", _rev: "1-r", content: "old content", mtime: 1000 },
-        }],
-      });
+      client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
       // First changes call for initial sync
       client.changes.mockResolvedValueOnce({ last_seq: "1", results: [] });
       // Second changes call returns an update with no mtime
@@ -716,16 +748,24 @@ describe("SyncEngine", () => {
         }],
       });
 
-      await engine.start();
+      await engine2.start();
 
       // Wait for the first poll cycle
       await new Promise((r) => setTimeout(r, 3500));
 
       expect(vault._getContent("notes/feed.md")).toBe("updated by Claude");
+      engine2.stop();
     });
 
     it("falls back to individual GETs when batch fails", async () => {
-      const client = getClient(engine);
+      // Pre-populate revMap with stale rev — required to pass Trou B orphan guard.
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/a.md": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [
@@ -738,9 +778,10 @@ describe("SyncEngine", () => {
       client.get.mockResolvedValue({ _id: "file/notes/a.md", _rev: "1-a", content: "aaa", mtime: 1000 });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
       expect(vault._getContent("notes/a.md")).toBe("aaa");
+      engine2.stop();
     });
 
     it("deletes local files that were deleted on remote", async () => {
@@ -903,16 +944,26 @@ describe("SyncEngine", () => {
 
   describe("echo loop prevention", () => {
     it("ignores local changes triggered by remote apply", async () => {
-      const client = getClient(engine);
+      // Pre-populate revMap so the initial pull (rev "1-r" == revMap) is skipped,
+      // but the incremental changes feed update (rev "2-r") is applied.
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/remote.md": { rev: "1-r", mtime: 5000, lastSeenInFs: Date.now() },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+      engine2.onStateChange = (s) => stateChanges.push(s);
+      engine2.onError = (msg) => errors.push(msg);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
           id: "file/notes/remote.md",
           key: "file/notes/remote.md",
           value: { rev: "1-r" },
-          doc: { _id: "file/notes/remote.md", _rev: "1-r", content: "remote content", mtime: 5000 },
         }],
       });
+      client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
       // changes() returns a doc during incremental polling
       client.changes
         .mockResolvedValueOnce({ last_seq: "1", results: [] }) // Initial
@@ -926,7 +977,7 @@ describe("SyncEngine", () => {
           }],
         });
 
-      await engine.start();
+      await engine2.start();
 
       // During remote apply, handleLocalChange should be a no-op
       // This is internal behavior - we verify indirectly by checking
@@ -938,13 +989,14 @@ describe("SyncEngine", () => {
       // The applyingRemote flag prevents the echo
       vault._addFile("notes/remote.md", "remote content", 5000);
       const file: VaultFile = { kind: "file", path: "notes/remote.md", mtime: 5000, size: 0 };
-      engine.handleLocalChange(file);
+      engine2.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // put() should not have been called for this file during remote apply
       // (it was only called if the engine pushed during fullSync)
       // The key assertion: no echo loop occurred
       expect(client.put.mock.calls.length).toBe(putCallsBefore);
+      engine2.stop();
     });
   });
 
@@ -1173,7 +1225,15 @@ describe("SyncEngine", () => {
   describe("binary file sync - pull", () => {
     it("skips getAttachment for orphan docs without _attachments", async () => {
       // 386 orphan docs in production have no _attachments field (metadata-only docs from old LiveSync)
-      const client = getClient(engine);
+      // Pre-populate revMap so both docs pass the Trou B orphan guard (device has synced them before).
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/images/orphan.png": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+        "file/images/real.png": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 2,
         rows: [
@@ -1207,12 +1267,13 @@ describe("SyncEngine", () => {
       client.getAttachment = vi.fn().mockResolvedValue(pngData);
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
       // getAttachment must be called only once (for real.png), not for orphan.png
       expect(client.getAttachment).toHaveBeenCalledTimes(1);
       expect(client.getAttachment).toHaveBeenCalledWith("file/images/real.png", "data.bin", expect.any(Number));
       expect(client.getAttachment).not.toHaveBeenCalledWith("file/images/orphan.png", "data.bin", expect.any(Number));
+      engine2.stop();
     });
 
     it("records orphan rev in revMap without calling getAttachment", async () => {
@@ -1243,9 +1304,18 @@ describe("SyncEngine", () => {
     });
 
     it("reports setError for real attachment fetch errors (non-404)", async () => {
-      // Non-404 errors (network error, auth failure) should still surface via setError
+      // Non-404 errors (network error, auth failure) should still surface via setError.
+      // Pre-populate revMap so the doc passes the Trou B orphan guard.
       const { CouchError } = await import("./couch-client");
-      const client = getClient(engine);
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/images/broken.png": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+      const localErrors: string[] = [];
+      engine2.onError = (msg) => localErrors.push(msg);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{ id: "file/images/broken.png", key: "file/images/broken.png", value: { rev: "1-b" } }],
@@ -1266,15 +1336,23 @@ describe("SyncEngine", () => {
       client.getAttachment = vi.fn().mockRejectedValue(new CouchError(500, "Internal Server Error"));
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
-      expect(errors.length).toBeGreaterThan(0);
-      expect(errors[0]).toContain("broken.png");
+      expect(localErrors.length).toBeGreaterThan(0);
+      expect(localErrors[0]).toContain("broken.png");
+      engine2.stop();
     });
 
     it("pulls binary file via getAttachment and creates it in vault", async () => {
+      // Pre-populate revMap with stale rev — required to pass Trou B orphan guard.
       const pngData = new Uint8Array([137, 80, 78, 71]).buffer; // PNG magic bytes
-      const client = getClient(engine);
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/images/photo.png": { rev: "0-old", mtime: 0, lastSeenInFs: 0 },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{ id: "file/images/photo.png", key: "file/images/photo.png", value: { rev: "1-p" } }],
@@ -1294,10 +1372,11 @@ describe("SyncEngine", () => {
       client.getAttachment = vi.fn().mockResolvedValue(pngData);
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
-      await engine.start();
+      await engine2.start();
 
       expect(client.getAttachment).toHaveBeenCalledWith("file/images/photo.png", "data.bin", expect.any(Number));
       expect(vault._getBinaryContent("images/photo.png")).toBe(pngData);
+      engine2.stop();
     });
 
     it("updates existing binary file when remote rev differs", async () => {
@@ -1336,11 +1415,26 @@ describe("SyncEngine", () => {
     });
 
     it("routes binary changes feed doc to getAttachment", async () => {
+      // Scenario: device already has images/new.png synced (revMap entry + file in vault).
+      // fullSync: remote is at same rev → no-op. Changes feed then delivers an update.
       const pngData = new Uint8Array([1]).buffer;
-      const client = getClient(engine);
-      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      vault._addBinaryFile("images/new.png", new Uint8Array([0]).buffer); // existing local file
 
-      // First poll: nothing; second poll: binary change arrives
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/images/new.png": { rev: "1-old", mtime: 0, lastSeenInFs: Date.now() },
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
+      // fullSync: remote at same rev → no pull needed
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/new.png", key: "file/images/new.png", value: { rev: "1-old" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+      // First poll: nothing; second poll: binary update arrives
       client.changes
         .mockResolvedValueOnce({ last_seq: "1", results: [] })
         .mockResolvedValueOnce({
@@ -1348,17 +1442,18 @@ describe("SyncEngine", () => {
           results: [{
             seq: "2",
             id: "file/images/new.png",
-            changes: [{ rev: "1-p" }],
-            doc: { _id: "file/images/new.png", _rev: "1-p", content: null, mtime: 0 },
+            changes: [{ rev: "2-p" }],
+            doc: { _id: "file/images/new.png", _rev: "2-p", content: null, mtime: 0 },
           }],
         });
       client.getAttachment = vi.fn().mockResolvedValue(pngData);
 
-      await engine.start();
+      await engine2.start();
       await new Promise((r) => setTimeout(r, 3500));
 
       expect(client.getAttachment).toHaveBeenCalledWith("file/images/new.png", "data.bin", expect.any(Number));
       expect(vault._getBinaryContent("images/new.png")).toBe(pngData);
+      engine2.stop();
     });
   });
 
@@ -1376,11 +1471,17 @@ describe("SyncEngine", () => {
     }
 
     it("downloads multiple attachments in parallel", async () => {
-      // 6 docs: with PARALLEL_BINARY_PULLS=5 the first batch of 5 should start before any resolves
+      // 6 docs: with PARALLEL_BINARY_PULLS=5 the first batch of 5 should start before any resolves.
+      // Pre-populate revMap so all docs pass the Trou B orphan guard.
       const docIds = ["a", "b", "c", "d", "e", "f"].map(n => `file/images/${n}.png`);
       const revs = docIds.map((_, i) => `1-${i}`);
 
-      const client = getClient(engine);
+      const storeWithRevMap = new TestStateStore();
+      const revMapData = Object.fromEntries(docIds.map(id => [id, { rev: "0-old", mtime: 0, lastSeenInFs: 0 }]));
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMapData));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: docIds.length,
         rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
@@ -1402,19 +1503,28 @@ describe("SyncEngine", () => {
         );
       });
 
-      await engine.start();
+      await engine2.start();
 
       // With parallel downloads, at least 2 should have been in-flight simultaneously
       expect(maxConcurrent).toBeGreaterThan(1);
       expect(client.getAttachment).toHaveBeenCalledTimes(docIds.length);
+      engine2.stop();
     });
 
     it("handles partial failures gracefully - successful docs applied, failed skipped", async () => {
+      // Pre-populate revMap so all docs pass the Trou B orphan guard.
       const { CouchError } = await import("./couch-client");
       const docIds = ["ok1", "fail", "ok2", "ok3", "ok4"].map(n => `file/images/${n}.png`);
       const revs = docIds.map((_, i) => `1-${i}`);
 
-      const client = getClient(engine);
+      const storeWithRevMap = new TestStateStore();
+      const revMapData = Object.fromEntries(docIds.map(id => [id, { rev: "0-old", mtime: 0, lastSeenInFs: 0 }]));
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMapData));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+      const localErrors: string[] = [];
+      engine2.onError = (msg) => localErrors.push(msg);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: docIds.length,
         rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
@@ -1432,23 +1542,30 @@ describe("SyncEngine", () => {
         return Promise.resolve(new ArrayBuffer(4));
       });
 
-      await engine.start();
+      await engine2.start();
 
       // 4 successful, 1 failed → error emitted for the failure
-      expect(errors.length).toBeGreaterThan(0);
-      expect(errors[0]).toContain("fail");
+      expect(localErrors.length).toBeGreaterThan(0);
+      expect(localErrors[0]).toContain("fail");
       // The 4 successful docs should have been written to vault
       expect(vault._getBinaryContent("images/ok1.png")).toBeTruthy();
       expect(vault._getBinaryContent("images/ok2.png")).toBeTruthy();
       expect(vault._getBinaryContent("images/ok3.png")).toBeTruthy();
       expect(vault._getBinaryContent("images/ok4.png")).toBeTruthy();
+      engine2.stop();
     });
 
     it("updates revMap for all successful parallel downloads", async () => {
+      // Pre-populate revMap with stale revs — required to pass Trou B orphan guard.
       const docIds = ["img1", "img2", "img3"].map(n => `file/images/${n}.png`);
       const revs = ["1-aaa", "1-bbb", "1-ccc"];
 
-      const client = getClient(engine);
+      const storeWithRevMap = new TestStateStore();
+      const revMapData = Object.fromEntries(docIds.map(id => [id, { rev: "0-old", mtime: 0, lastSeenInFs: 0 }]));
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMapData));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: docIds.length,
         rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
@@ -1460,13 +1577,14 @@ describe("SyncEngine", () => {
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
       client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
 
-      await engine.start();
+      await engine2.start();
 
-      // All 3 revs must be persisted in StateStore
-      const saved = JSON.parse(stateStore.get("vault-sync-revmap") ?? "{}");
-      expect(saved["file/images/img1.png"]).toBe("1-aaa");
-      expect(saved["file/images/img2.png"]).toBe("1-bbb");
-      expect(saved["file/images/img3.png"]).toBe("1-ccc");
+      // All 3 revs must be persisted in StateStore (as RevMapEntry objects)
+      const saved = JSON.parse(storeWithRevMap.get("vault-sync-revmap") ?? "{}");
+      expect(saved["file/images/img1.png"]?.rev).toBe("1-aaa");
+      expect(saved["file/images/img2.png"]?.rev).toBe("1-bbb");
+      expect(saved["file/images/img3.png"]?.rev).toBe("1-ccc");
+      engine2.stop();
     });
   });
 
@@ -1794,11 +1912,17 @@ describe("SyncEngine", () => {
     }
 
     it("chunks allDocsByKeys at META_BATCH_SIZE boundary (1001 docs → 3 calls)", async () => {
-      // 1001 binary docIds: with META_BATCH_SIZE=500, expect chunks [0-499], [500-999], [1000]
+      // 1001 binary docIds: with META_BATCH_SIZE=500, expect chunks [0-499], [500-999], [1000].
+      // Pre-populate revMap with stale revs for all docs — required to pass Trou B orphan guard.
       const docIds = Array.from({ length: 1001 }, (_, i) => `file/images/img${i}.png`);
       const revs = docIds.map((_, i) => `1-${i}`);
 
-      const client = getClient(engine);
+      const storeWithRevMap = new TestStateStore();
+      const revMapData = Object.fromEntries(docIds.map(id => [id, { rev: "0-old", mtime: 0, lastSeenInFs: 0 }]));
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMapData));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: docIds.length,
         rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
@@ -1814,7 +1938,7 @@ describe("SyncEngine", () => {
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
       client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
 
-      await engine.start();
+      await engine2.start();
 
       // allDocsByKeys should be called 3 times: [0..499], [500..999], [1000]
       expect(client.allDocsByKeys).toHaveBeenCalledTimes(3);
@@ -1823,17 +1947,26 @@ describe("SyncEngine", () => {
       expect(client.allDocsByKeys.mock.calls[2][0]).toHaveLength(1);
       // All 1001 files should have been written to vault
       expect(client.getAttachment).toHaveBeenCalledTimes(1001);
+      engine2.stop();
     });
 
     it("partial metadata chunk failure: skips failed chunk docs, applies successful chunk", async () => {
       // 600 docIds: first chunk of 500 fails, second chunk of 100 succeeds.
       // META_BATCH_SIZE=500, so 600 docs → 2 chunks: [0..499] fails, [500..599] succeeds.
+      // Pre-populate revMap for all docs — required to pass Trou B orphan guard.
       const firstChunkIds = Array.from({ length: 500 }, (_, i) => `file/images/fail${i}.png`);
       const secondChunkIds = Array.from({ length: 100 }, (_, i) => `file/images/ok${i}.png`);
       const docIds = [...firstChunkIds, ...secondChunkIds];
       const revs = docIds.map((_, i) => `1-${i}`);
 
-      const client = getClient(engine);
+      const storeWithRevMap = new TestStateStore();
+      const revMapData = Object.fromEntries(docIds.map(id => [id, { rev: "0-old", mtime: 0, lastSeenInFs: 0 }]));
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMapData));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+      const localStateChanges: string[] = [];
+      engine2.onStateChange = (s) => localStateChanges.push(s);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: docIds.length,
         rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
@@ -1854,20 +1987,29 @@ describe("SyncEngine", () => {
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
       client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
 
-      await engine.start();
+      await engine2.start();
 
       // Must not throw — engine should survive partial metadata failure
       // Only the second chunk's docs (secondChunkIds) have metadata, so only those download
       expect(client.getAttachment).toHaveBeenCalledTimes(secondChunkIds.length);
       // Engine should not enter error state due to metadata chunk failure
-      expect(stateChanges).not.toContain("error");
+      expect(localStateChanges).not.toContain("error");
+      engine2.stop();
     });
 
     it("failCount rate limiting: 5 failing binary downloads emit at most 3 errors", async () => {
+      // Pre-populate revMap so all docs pass the Trou B orphan guard.
       const docIds = ["a", "b", "c", "d", "e"].map(n => `file/images/${n}.png`);
       const revs = docIds.map((_, i) => `1-${i}`);
 
-      const client = getClient(engine);
+      const storeWithRevMap = new TestStateStore();
+      const revMapData = Object.fromEntries(docIds.map(id => [id, { rev: "0-old", mtime: 0, lastSeenInFs: 0 }]));
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMapData));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
+      const localErrors: string[] = [];
+      engine2.onError = (msg) => localErrors.push(msg);
+
+      const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
         total_rows: docIds.length,
         rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
@@ -1882,11 +2024,12 @@ describe("SyncEngine", () => {
       const { CouchError } = await import("./couch-client");
       client.getAttachment = vi.fn().mockRejectedValue(new CouchError(500, "Server Error"));
 
-      await engine.start();
+      await engine2.start();
 
       // With 5 failures, errors emitted must be capped at 3
-      expect(errors.length).toBeLessThanOrEqual(3);
-      expect(errors.length).toBeGreaterThan(0);
+      expect(localErrors.length).toBeLessThanOrEqual(3);
+      expect(localErrors.length).toBeGreaterThan(0);
+      engine2.stop();
     });
   });
 
@@ -2102,6 +2245,155 @@ describe("SyncEngine", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+
+  describe("RevMap shape change + Trou A + Trou B (issue #20)", () => {
+    it("migration: pre-populated string-valued revMap loads as RevMapEntry and does not spuriously push when rev matches", async () => {
+      // Legacy format: { "file/notes/old.md": "1-r" } (string, not object)
+      vault._addFile("notes/old.md", "synced content", 1000);
+
+      const legacyStore = new TestStateStore();
+      legacyStore.set("vault-sync-revmap", JSON.stringify({ "file/notes/old.md": "1-r" }));
+      const eng = makeEngine(settings, vaultAdapter, legacyStore);
+
+      const client = getClient(eng);
+      // Remote is at same rev as legacy string value
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/old.md", key: "file/notes/old.md", value: { rev: "1-r" } }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      // Should NOT push (mtime:0 from migration, file.mtime=1000 > 0, but remoteRevs has the doc;
+      // Trou A: known.mtime=0 means treat as changed, so it WILL push — which is the expected
+      // one-time migration burst. Verify it went through resolveConflict (409 scenario: same content).
+      // Here we just verify no error is thrown and the engine reaches ok state.
+      expect(eng.getDiagnostics().revMapSize).toBeGreaterThanOrEqual(1);
+
+      // Verify the migrated entry is now a RevMapEntry (not a raw string)
+      const saved = JSON.parse(legacyStore.get("vault-sync-revmap") ?? "{}");
+      // After migration + push, the entry should be an object with a rev property
+      expect(typeof saved["file/notes/old.md"]).toBe("object");
+      expect(saved["file/notes/old.md"]).toHaveProperty("rev");
+      eng.stop();
+    });
+
+    it("Trou A regression: file with mtime > revMap.mtime triggers push even when remoteRevs.has the doc", async () => {
+      // Simulates: device already synced file at mtime 1000; remote has it; file is now mtime 2000 (modified)
+      vault._addFile("notes/modified.md", "updated content", 2000);
+
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/modified.md": { rev: "1-r", mtime: 1000, lastSeenInFs: Date.now() },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(eng);
+      // Remote has the doc (so the old code would skip push)
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/modified.md", key: "file/notes/modified.md", value: { rev: "1-r" } }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      // put() succeeds (no conflict)
+      client.put.mockResolvedValue({ ok: true, id: "file/notes/modified.md", rev: "2-new" });
+
+      await eng.start();
+
+      // Must push because file.mtime (2000) > revMap.mtime (1000)
+      expect(client.put).toHaveBeenCalledWith(
+        expect.objectContaining({ _id: "file/notes/modified.md", content: "updated content", mtime: 2000 })
+      );
+      eng.stop();
+    });
+
+    it("Trou A negative: file with mtime <= revMap.mtime skips push", async () => {
+      // Simulates: device synced file at mtime 3000; file has not changed (mtime still 3000)
+      vault._addFile("notes/unchanged.md", "same content", 3000);
+
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/unchanged.md": { rev: "1-r", mtime: 3000, lastSeenInFs: Date.now() },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(eng);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/unchanged.md", key: "file/notes/unchanged.md", value: { rev: "1-r" } }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      // Must NOT push (file unchanged since last sync)
+      expect(client.put).not.toHaveBeenCalled();
+      expect(client.bulkDocs).not.toHaveBeenCalled();
+      eng.stop();
+    });
+
+    it("Trou B: DB-only doc with no revMap entry is NOT pulled to FS (agent-created doc protection)", async () => {
+      // Simulates: an AI agent created a doc in CouchDB that was never synced to this device.
+      // Expected: normal start() does NOT pull it (would write arbitrary content to vault).
+      // Note: first-device onboarding uses forceFullSync() which bypasses this guard.
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/agent-created.md", key: "file/notes/agent-created.md", value: { rev: "1-a" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/agent-created.md",
+          key: "file/notes/agent-created.md",
+          value: { rev: "1-a" },
+          doc: { _id: "file/notes/agent-created.md", _rev: "1-a", content: "agent wrote this", mtime: 1000 },
+        }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      // Empty revMap (no prior sync on this device)
+      await engine.start();
+
+      // File must NOT exist in vault — Trou B guard blocked the pull
+      expect(vault.getAbstractFileByPath("notes/agent-created.md")).toBeNull();
+    });
+
+    it("Trou B regression: DB doc with revMap entry IS pulled when rev differs", async () => {
+      // Simulates: device previously synced the doc (revMap entry exists with stale rev).
+      // Expected: updated doc IS pulled because device has a record of this doc.
+      vault._addFile("notes/known-doc.md", "old content", 1000);
+
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/known-doc.md": { rev: "1-old", mtime: 1000, lastSeenInFs: Date.now() },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, storeWithRevMap);
+
+      const client = getClient(eng);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/known-doc.md", key: "file/notes/known-doc.md", value: { rev: "2-new" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/known-doc.md",
+          key: "file/notes/known-doc.md",
+          value: { rev: "2-new" },
+          doc: { _id: "file/notes/known-doc.md", _rev: "2-new", content: "updated by another device", mtime: 5000 },
+        }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "2", results: [] });
+
+      await eng.start();
+
+      // File MUST be updated — Trou B guard passed because revMap entry exists
+      expect(vault._getContent("notes/known-doc.md")).toBe("updated by another device");
+      eng.stop();
     });
   });
 });

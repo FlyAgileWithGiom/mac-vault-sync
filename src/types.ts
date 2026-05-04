@@ -26,9 +26,15 @@ export interface SyncCounts {
   pendingPull: number;
 }
 
-/** Tracks known revision for each doc to detect remote changes */
+export interface RevMapEntry {
+  rev: string;
+  mtime: number;        // file.mtime at last successful push/pull; 0 until first sync
+  lastSeenInFs: number; // timestamp (ms) of last confirmed FS presence; 0 if never seen
+}
+
+/** Tracks known revision and mtime for each doc to detect remote changes and skip unchanged files */
 export interface RevMap {
-  [docId: string]: string;
+  [docId: string]: RevMapEntry;
 }
 
 export interface CouchDoc {
