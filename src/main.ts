@@ -29,10 +29,10 @@ export default class VaultSyncPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    // Auto-derive database name from vault name
-    const derivedDb = `vault-${slugify(this.app.vault.getName())}`;
-    if (this.settings.couchDbName !== derivedDb) {
-      this.settings.couchDbName = derivedDb;
+    // Auto-derive database name from vault name only when couchDbName is not set.
+    // Running unconditionally would overwrite a user-configured DB name on every load.
+    if (!this.settings.couchDbName) {
+      this.settings.couchDbName = `vault-${slugify(this.app.vault.getName())}`;
       await this.saveSettings();
     }
 
@@ -166,8 +166,14 @@ export default class VaultSyncPlugin extends Plugin {
 
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
 
-    // Migrate data.json to .vault-sync.json when a real URL is present
-    if (this.settings.couchDbUrl && this.settings.couchDbUrl !== DEFAULT_SETTINGS.couchDbUrl) {
+    // Migrate data.json to .vault-sync.json when any meaningful setting is present.
+    // Guard is intentionally broad: users who keep the default URL but have credentials
+    // or a DB name set must still be migrated so BRAT upgrades don't wipe their settings.
+    const hasMeaningfulSettings =
+      (this.settings.couchDbName && this.settings.couchDbName !== DEFAULT_SETTINGS.couchDbName) ||
+      (this.settings.couchDbUser && this.settings.couchDbUser !== DEFAULT_SETTINGS.couchDbUser) ||
+      (this.settings.couchDbPassword && this.settings.couchDbPassword !== DEFAULT_SETTINGS.couchDbPassword);
+    if (hasMeaningfulSettings) {
       await this.app.vault.adapter.write(
         VAULT_SYNC_CONFIG_FILE,
         JSON.stringify(this.settings, null, 2)

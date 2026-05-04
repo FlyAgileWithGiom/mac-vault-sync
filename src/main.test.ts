@@ -169,6 +169,42 @@ describe("VaultSyncPlugin.loadSettings", () => {
     expect(plugin.saveData).not.toHaveBeenCalled();
     expect(plugin.app.vault.adapter._has(VAULT_SYNC_CONFIG_FILE)).toBe(false);
   });
+
+  it("migrates data.json to .vault-sync.json when user has credentials even if couchDbUrl is default", async () => {
+    // Bug: previous migration guard was `couchDbUrl !== DEFAULT_SETTINGS.couchDbUrl`.
+    // A user keeping the default URL but with credentials set would never migrate → settings lost on BRAT upgrade.
+    const legacyData = {
+      couchDbUrl: DEFAULT_SETTINGS.couchDbUrl, // default URL kept
+      couchDbName: "vault-obsidiannotes",
+      couchDbUser: "alice",
+      couchDbPassword: "secret",
+      syncDebounceMs: 500,
+      excludePatterns: [".trash/"],
+    };
+    (plugin.loadData as ReturnType<typeof vi.fn>).mockResolvedValue(legacyData);
+
+    await plugin.loadSettings();
+
+    // Should have written to .vault-sync.json despite default URL
+    const written = plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE);
+    expect(written).toBeDefined();
+    const parsed = JSON.parse(written!);
+    expect(parsed.couchDbUser).toBe("alice");
+
+    // data.json cleared
+    expect(plugin.saveData).toHaveBeenCalledWith({});
+  });
+
+  it("does NOT migrate when data.json has no meaningful settings (truly unconfigured)", async () => {
+    // data.json has only defaults — no credentials, no DB name → no migration
+    const data = { ...DEFAULT_SETTINGS, couchDbName: "", couchDbUser: "", couchDbPassword: "" };
+    (plugin.loadData as ReturnType<typeof vi.fn>).mockResolvedValue(data);
+
+    await plugin.loadSettings();
+
+    expect(plugin.saveData).not.toHaveBeenCalled();
+    expect(plugin.app.vault.adapter._has(VAULT_SYNC_CONFIG_FILE)).toBe(false);
+  });
 });
 
 // ---- saveSettings tests ----
@@ -210,6 +246,92 @@ describe("VaultSyncPlugin.saveSettings", () => {
     const written = plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!;
     // Pretty-printed JSON contains newlines
     expect(written).toContain("\n");
+  });
+});
+
+// ---- onload DB name auto-derive tests ----
+
+/** Helper DOM element stub used in onload tests */
+function makeOnloadEl() {
+  return {
+    dataset: {} as Record<string, string>,
+    setAttribute: vi.fn(),
+    className: "",
+    addClass: vi.fn(),
+    setText: vi.fn(),
+  };
+}
+
+describe("VaultSyncPlugin.onload — auto-derive couchDbName", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("derives couchDbName from vault name when couchDbName is empty (first install)", async () => {
+    const plugin = makePlugin();
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({ ...DEFAULT_SETTINGS, couchDbName: "" })
+    );
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "MyNotes";
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeOnloadEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeOnloadEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    expect(plugin.settings.couchDbName).toBe("vault-mynotes");
+  });
+
+  it("does NOT overwrite a user-configured couchDbName that differs from the derived value", async () => {
+    // Bug: previous code overwrote couchDbName unconditionally on every onload.
+    // A user who set couchDbName to a custom value would lose it on every plugin reload.
+    const customDbName = "my-custom-db-name";
+    const plugin = makePlugin();
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://sync.fly-agile.com",
+        couchDbName: customDbName,
+        couchDbUser: "alice",
+        couchDbPassword: "secret",
+        syncDebounceMs: 500,
+        excludePatterns: [".trash/"],
+      })
+    );
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "MyNotes";
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeOnloadEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeOnloadEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    // User's custom DB name must be preserved
+    expect(plugin.settings.couchDbName).toBe(customDbName);
+  });
+
+  it("derives couchDbName when missing from loaded settings (fallback from old data.json)", async () => {
+    const plugin = makePlugin();
+    // .vault-sync.json absent; data.json has no couchDbName
+    (plugin.loadData as ReturnType<typeof vi.fn>).mockResolvedValue({
+      couchDbUrl: DEFAULT_SETTINGS.couchDbUrl,
+      couchDbUser: "",
+      couchDbPassword: "",
+      syncDebounceMs: 500,
+      excludePatterns: [],
+    });
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "VaultA";
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeOnloadEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeOnloadEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    expect(plugin.settings.couchDbName).toBe("vault-vaulta");
   });
 });
 
