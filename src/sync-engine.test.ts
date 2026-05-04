@@ -1970,6 +1970,195 @@ describe("SyncEngine", () => {
     });
   });
 
+  describe("ghost directory cleanup - handleLocalDelete", () => {
+    // Helper: build engine with pre-populated revMap so handleLocalDelete sees a known rev.
+    function makeEngineWithRevMap(revMap: Record<string, string>): { eng: SyncEngine; cli: ReturnType<typeof vi.fn> & Record<string, ReturnType<typeof vi.fn>> } {
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify(revMap));
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const cli = getClient(eng);
+      return { eng, cli };
+    }
+
+    async function startEngine(eng: SyncEngine, cli: ReturnType<typeof vi.fn> & Record<string, ReturnType<typeof vi.fn>>) {
+      cli.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      cli.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      cli.delete.mockResolvedValue({ ok: true, id: "", rev: "2-del" });
+      await eng.start();
+    }
+
+    it("cleans empty parent dir when last file in dir is deleted locally", async () => {
+      vault._addFile("folder/last.md", "content", 1000);
+      vault._addFolder("folder", []); // empty after deletion
+      const { eng, cli } = makeEngineWithRevMap({ "file/folder/last.md": "1-rev" });
+      await startEngine(eng, cli);
+
+      // Delete the file from disk (simulate OS event — file already gone)
+      const tf = vault.getAbstractFileByPath("folder/last.md");
+      if (tf) await vault.delete(tf as TFile);
+
+      const file: VaultEntry = { kind: "file", path: "folder/last.md", mtime: 1000, size: 0 };
+      await eng.handleLocalDelete(file);
+
+      expect(vault._hasFolder("folder")).toBe(false);
+      eng.stop();
+    });
+
+    it("cleans nested empty parent dirs when last file is deleted locally", async () => {
+      vault._addFile("a/b/c/last.md", "deep", 1000);
+      vault._addFolder("a/b/c", []);
+      vault._addFolder("a/b", []);
+      const otherFile = new TFile("a/other.md");
+      vault._addFolder("a", [otherFile]);
+      const { eng, cli } = makeEngineWithRevMap({ "file/a/b/c/last.md": "1-rev" });
+      await startEngine(eng, cli);
+
+      const tf = vault.getAbstractFileByPath("a/b/c/last.md");
+      if (tf) await vault.delete(tf as TFile);
+
+      const file: VaultEntry = { kind: "file", path: "a/b/c/last.md", mtime: 1000, size: 0 };
+      await eng.handleLocalDelete(file);
+
+      expect(vault._hasFolder("a/b/c")).toBe(false);
+      expect(vault._hasFolder("a/b")).toBe(false);
+      expect(vault._hasFolder("a")).toBe(true); // has other.md — not empty
+      eng.stop();
+    });
+
+    it("keeps parent dir when a sibling file remains after local delete", async () => {
+      vault._addFile("folder/gone.md", "bye", 1000);
+      const sibling = new TFile("folder/sibling.md");
+      vault._addFolder("folder", [sibling]);
+      const { eng, cli } = makeEngineWithRevMap({ "file/folder/gone.md": "1-rev" });
+      await startEngine(eng, cli);
+
+      const tf = vault.getAbstractFileByPath("folder/gone.md");
+      if (tf) await vault.delete(tf as TFile);
+
+      const file: VaultEntry = { kind: "file", path: "folder/gone.md", mtime: 1000, size: 0 };
+      await eng.handleLocalDelete(file);
+
+      expect(vault._hasFolder("folder")).toBe(true);
+      eng.stop();
+    });
+
+    it("cleans empty parent dir when file was never synced (no rev)", async () => {
+      // File exists locally but was never pushed to CouchDB — !rev early-return path.
+      // The directory should still be cleaned up.
+      vault._addFile("unsync/note.md", "local", 1000);
+      vault._addFolder("unsync", []);
+      const { eng, cli } = makeEngineWithRevMap({}); // no revMap entry
+      await startEngine(eng, cli);
+
+      const tf = vault.getAbstractFileByPath("unsync/note.md");
+      if (tf) await vault.delete(tf as TFile);
+
+      const file: VaultEntry = { kind: "file", path: "unsync/note.md", mtime: 1000, size: 0 };
+      await eng.handleLocalDelete(file);
+
+      expect(vault._hasFolder("unsync")).toBe(false);
+      eng.stop();
+    });
+
+    it("does not delete excluded dirs (.obsidian/) on local delete", async () => {
+      // .obsidian/ is excluded — handleLocalDelete returns early due to isExcluded guard.
+      // Cleanup is never reached, folder stays.
+      vault._addFile(".obsidian/config", "data", 1000);
+      vault._addFolder(".obsidian", []);
+      const { eng, cli } = makeEngineWithRevMap({ "file/.obsidian/config": "1-rev" });
+      await startEngine(eng, cli);
+
+      // .obsidian/ is in excludePatterns — handleLocalDelete returns early, no cleanup
+      const file: VaultEntry = { kind: "file", path: ".obsidian/config", mtime: 1000, size: 0 };
+      await eng.handleLocalDelete(file);
+
+      expect(vault._hasFolder(".obsidian")).toBe(true);
+      eng.stop();
+    });
+
+    it("does not fail the sync when cleanupEmptyParents throws", async () => {
+      // Simulate a deleteDirectory error — cleanup errors must be swallowed.
+      vault._addFile("folder/last.md", "content", 1000);
+      vault._addFolder("folder", []);
+      const { eng, cli } = makeEngineWithRevMap({ "file/folder/last.md": "1-rev" });
+      await startEngine(eng, cli);
+
+      const tf = vault.getAbstractFileByPath("folder/last.md");
+      if (tf) await vault.delete(tf as TFile);
+
+      // Patch adapter to throw on deleteDirectory
+      const original = vaultAdapter.deleteDirectory.bind(vaultAdapter);
+      vaultAdapter.deleteDirectory = vi.fn().mockRejectedValue(new Error("fs error"));
+
+      const errorSpy = vi.fn();
+      eng.onError = errorSpy;
+
+      const file: VaultEntry = { kind: "file", path: "folder/last.md", mtime: 1000, size: 0 };
+      // Should NOT throw
+      await expect(eng.handleLocalDelete(file)).resolves.toBeUndefined();
+      // Should NOT surface a sync error
+      expect(errorSpy).not.toHaveBeenCalled();
+
+      vaultAdapter.deleteDirectory = original;
+      eng.stop();
+    });
+  });
+
+  describe("ghost directory cleanup - handleLocalRename", () => {
+    it("cleans empty old-path parent dir after local rename", async () => {
+      // File moves from folder-a/ to folder-b/ — folder-a/ becomes empty
+      vault._addFile("folder-a/note.md", "content", 1000);
+      vault._addFile("folder-b/note.md", "content", 1000); // destination already exists
+      vault._addFolder("folder-a", []); // empty after rename-out
+      vault._addFolder("folder-b", [new TFile("folder-b/note.md")]);
+
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({ "file/folder-a/note.md": "1-rev" }));
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const cli = getClient(eng);
+      cli.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      cli.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      cli.delete.mockResolvedValue({ ok: true, id: "file/folder-a/note.md", rev: "2-del" });
+      cli.get.mockRejectedValue(new Error("not found"));
+      cli.put.mockResolvedValue({ ok: true, id: "file/folder-b/note.md", rev: "1-new" });
+
+      await eng.start();
+
+      const newFile: VaultEntry = { kind: "file", path: "folder-b/note.md", mtime: 1000, size: 0 };
+      await eng.handleLocalRename(newFile, "folder-a/note.md");
+
+      expect(vault._hasFolder("folder-a")).toBe(false);
+      expect(vault._hasFolder("folder-b")).toBe(true);
+      eng.stop();
+    });
+
+    it("keeps old-path parent dir when a sibling remains after rename", async () => {
+      const sibling = new TFile("shared/sibling.md");
+      vault._addFile("shared/moved.md", "content", 1000);
+      vault._addFolder("shared", [sibling]); // sibling remains
+      vault._addFile("dest/moved.md", "content", 1000);
+      vault._addFolder("dest", [new TFile("dest/moved.md")]);
+
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({ "file/shared/moved.md": "1-rev" }));
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const cli = getClient(eng);
+      cli.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      cli.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      cli.delete.mockResolvedValue({ ok: true, id: "file/shared/moved.md", rev: "2-del" });
+      cli.get.mockRejectedValue(new Error("not found"));
+      cli.put.mockResolvedValue({ ok: true, id: "file/dest/moved.md", rev: "1-new" });
+
+      await eng.start();
+
+      const newFile: VaultEntry = { kind: "file", path: "dest/moved.md", mtime: 1000, size: 0 };
+      await eng.handleLocalRename(newFile, "shared/moved.md");
+
+      expect(vault._hasFolder("shared")).toBe(true); // sibling still there
+      eng.stop();
+    });
+  });
+
   describe("binary file sync - metadata chunk", () => {
     function makeBinaryAllDocsRow(id: string, rev: string) {
       return {

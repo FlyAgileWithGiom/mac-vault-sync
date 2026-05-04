@@ -1078,16 +1078,23 @@ export class SyncEngine {
   }
 
   private async cleanupEmptyParents(filePath: string): Promise<void> {
-    const parts = filePath.split("/");
-    for (let i = parts.length - 2; i >= 0; i--) {
-      const dirPath = this.normalizePath(parts.slice(0, i + 1).join("/"));
-      const dir = this.vault.getEntryByPath(dirPath);
-      if (!dir || dir.kind !== "folder") break;
-      if (await this.vault.isDirectoryEmpty(dirPath)) {
-        await this.vault.deleteDirectory(dir);
-      } else {
-        break;
+    // Best-effort: never let cleanup errors propagate to the caller or fail the sync.
+    try {
+      const parts = filePath.split("/");
+      for (let i = parts.length - 2; i >= 0; i--) {
+        const dirPath = this.normalizePath(parts.slice(0, i + 1).join("/"));
+        // Skip directories that match an exclude pattern (e.g. .git/, .obsidian/)
+        if (this.isExcluded(dirPath + "/")) break;
+        const dir = this.vault.getEntryByPath(dirPath);
+        if (!dir || dir.kind !== "folder") break;
+        if (await this.vault.isDirectoryEmpty(dirPath)) {
+          await this.vault.deleteDirectory(dir);
+        } else {
+          break;
+        }
       }
+    } catch {
+      // Directory cleanup is best-effort — ignore errors silently
     }
   }
 
@@ -1142,7 +1149,11 @@ export class SyncEngine {
     const entry = this.revMap[docId];
     const rev = entry?.rev;
     console.log(`[vault-sync] Delete: ${file.path} docId=${docId} rev=${rev ?? "NONE"}`);
-    if (!rev) return; // Never synced, nothing to do
+    if (!rev) {
+      // Never synced, nothing to do for CouchDB — still clean up empty parent dirs
+      await this.cleanupEmptyParents(file.path);
+      return;
+    }
 
     try {
       const result = await this.client.delete(docId, rev);
@@ -1158,6 +1169,7 @@ export class SyncEngine {
         this.setError(`Failed to delete remote ${file.path}: ${(e as Error).message}`);
       }
     }
+    await this.cleanupEmptyParents(file.path);
   }
 
   /** Called when a local file is renamed */
@@ -1182,6 +1194,9 @@ export class SyncEngine {
     if (!this.isExcluded(file.path)) {
       await this.pushFile(file);
     }
+
+    // Clean up empty parent dirs left behind by the old path
+    await this.cleanupEmptyParents(oldPath);
 
     this.persistState();
   }
