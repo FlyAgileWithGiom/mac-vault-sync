@@ -40,7 +40,7 @@ export class FilesystemVaultAdapter implements VaultAdapter {
           out.push({
             kind: "file",
             path: this.rel(full),
-            mtime: stat.mtimeMs,
+            mtime: Math.floor(stat.mtimeMs),
             size: stat.size,
           });
         } catch {
@@ -58,7 +58,7 @@ export class FilesystemVaultAdapter implements VaultAdapter {
         return { kind: "folder", path: relativePath };
       }
       if (stat.isFile()) {
-        return { kind: "file", path: relativePath, mtime: stat.mtimeMs, size: stat.size };
+        return { kind: "file", path: relativePath, mtime: Math.floor(stat.mtimeMs), size: stat.size };
       }
     } catch {
       // Not found
@@ -88,7 +88,7 @@ export class FilesystemVaultAdapter implements VaultAdapter {
     await fs.promises.mkdir(path.dirname(full), { recursive: true });
     await fs.promises.writeFile(full, content, "utf-8");
     const stat = fs.statSync(full);
-    return { kind: "file", path: relativePath, mtime: stat.mtimeMs, size: stat.size };
+    return { kind: "file", path: relativePath, mtime: Math.floor(stat.mtimeMs), size: stat.size };
   }
 
   async createBinary(relativePath: string, data: ArrayBuffer): Promise<VaultFile> {
@@ -96,7 +96,7 @@ export class FilesystemVaultAdapter implements VaultAdapter {
     await fs.promises.mkdir(path.dirname(full), { recursive: true });
     await fs.promises.writeFile(full, Buffer.from(data));
     const stat = fs.statSync(full);
-    return { kind: "file", path: relativePath, mtime: stat.mtimeMs, size: stat.size };
+    return { kind: "file", path: relativePath, mtime: Math.floor(stat.mtimeMs), size: stat.size };
   }
 
   async createDirectory(relativePath: string): Promise<void> {

@@ -12,7 +12,7 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     return this.vault.getFiles().map((f) => ({
       kind: "file" as const,
       path: f.path,
-      mtime: f.stat.mtime,
+      mtime: Math.floor(f.stat.mtime),
       size: f.stat.size,
     }));
   }
@@ -21,7 +21,7 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     const entry = this.vault.getAbstractFileByPath(path);
     if (!entry) return null;
     if (entry instanceof TFile) {
-      return { kind: "file", path: entry.path, mtime: entry.stat.mtime, size: entry.stat.size };
+      return { kind: "file", path: entry.path, mtime: Math.floor(entry.stat.mtime), size: entry.stat.size };
     }
     if (entry instanceof TFolder) {
       return { kind: "folder", path: entry.path };
@@ -55,12 +55,12 @@ export class ObsidianVaultAdapter implements VaultAdapter {
 
   async createText(path: string, content: string): Promise<VaultFile> {
     const tfile = await this.vault.create(path, content);
-    return { kind: "file", path: tfile.path, mtime: tfile.stat.mtime, size: tfile.stat.size };
+    return { kind: "file", path: tfile.path, mtime: Math.floor(tfile.stat.mtime), size: tfile.stat.size };
   }
 
   async createBinary(path: string, data: ArrayBuffer): Promise<VaultFile> {
     const tfile = await this.vault.createBinary(path, data);
-    return { kind: "file", path: tfile.path, mtime: tfile.stat.mtime, size: tfile.stat.size };
+    return { kind: "file", path: tfile.path, mtime: Math.floor(tfile.stat.mtime), size: tfile.stat.size };
   }
 
   async createDirectory(path: string): Promise<void> {
