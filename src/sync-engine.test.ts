@@ -940,6 +940,76 @@ describe("SyncEngine", () => {
         expect.objectContaining({ _id: "file/notes/renamed.md" })
       );
     });
+
+    it("calls handleRemoteDelete and surfaces no error when client.get returns 404 deleted (tombstone) in pushTextFile", async () => {
+      // Scenario: no revMap entry for the file, so pushTextFile calls client.get to fetch the
+      // current rev. The server returns a tombstone 404 (doc was deleted). Expected: local file
+      // deleted via handleRemoteDelete, client.put never called, no error surfaced (S14/S15 fix).
+      const { CouchError } = await import("./couch-client");
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      await engine.start();
+
+      vault._addFile("notes/resurrected.md", "local content", 1000);
+      const file: VaultFile = { kind: "file", path: "notes/resurrected.md", mtime: 1000, size: 0 };
+
+      // client.get returns tombstone — no revMap entry so pushTextFile will call get
+      client.get = vi.fn().mockRejectedValue(
+        new CouchError(404, 'CouchDB 404: {"error":"not_found","reason":"deleted"}'),
+      );
+      client.put = vi.fn(); // must not be called
+
+      const tombErrors: string[] = [];
+      engine.onError = (msg) => tombErrors.push(msg);
+
+      engine.handleLocalChange(file);
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Tombstone wins — local file should be removed
+      expect(vault.getAbstractFileByPath("notes/resurrected.md")).toBeNull();
+      // client.put must never be called (no resurrection)
+      expect(client.put).not.toHaveBeenCalled();
+      // No error surfaced to the user
+      expect(tombErrors).toHaveLength(0);
+    });
+
+    it("pushes as new doc when client.get returns 404 missing (not a tombstone) in pushTextFile", async () => {
+      // Scenario: no revMap entry, client.get returns a plain 404 (doc never existed — "missing").
+      // Expected: pushTextFile falls through and calls client.put without a _rev (new doc creation).
+      const { CouchError } = await import("./couch-client");
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      await engine.start();
+
+      vault._addFile("notes/brand-new.md", "new content", 2000);
+      const file: VaultFile = { kind: "file", path: "notes/brand-new.md", mtime: 2000, size: 0 };
+
+      // client.get returns a missing 404 (not a tombstone — reason is "missing" not "deleted")
+      client.get = vi.fn().mockRejectedValue(
+        new CouchError(404, 'CouchDB 404: {"error":"not_found","reason":"missing"}'),
+      );
+      client.put = vi.fn().mockResolvedValue({ ok: true, id: "file/notes/brand-new.md", rev: "1-new" });
+
+      const missErrors: string[] = [];
+      engine.onError = (msg) => missErrors.push(msg);
+
+      engine.handleLocalChange(file);
+      await new Promise((r) => setTimeout(r, 120));
+
+      // client.put must have been called without a _rev (new doc)
+      expect(client.put).toHaveBeenCalledWith(
+        expect.objectContaining({ _id: "file/notes/brand-new.md", content: "new content" }),
+      );
+      expect(client.put).toHaveBeenCalledWith(
+        expect.not.objectContaining({ _rev: expect.anything() }),
+      );
+      // No error surfaced
+      expect(missErrors).toHaveLength(0);
+    });
   });
 
   describe("echo loop prevention", () => {

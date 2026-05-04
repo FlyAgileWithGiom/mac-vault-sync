@@ -411,6 +411,7 @@ export class SyncEngine {
         // Fall through: file modified (or mtime unknown after migration) → push it.
         // For changed files, delegate to pushTextFile/pushBinaryFile which handle rev correctly.
         if (this.isBinaryDoc(docId)) {
+          if (this.settings.disableBinaryPush) { await this.yield(); continue; }
           await this.pushBinaryFile(file);
           await this.yield();
         } else {
@@ -433,6 +434,7 @@ export class SyncEngine {
 
       // Genuinely new file, not on remote
       if (this.isBinaryDoc(docId)) {
+        if (this.settings.disableBinaryPush) { await this.yield(); continue; }
         // Binary files need attachment PUT, not bulk_docs
         await this.pushBinaryFile(file);
         await this.yield();
@@ -1009,11 +1011,15 @@ export class SyncEngine {
 
   private async pushFile(file: VaultFile): Promise<void> {
     const key = file.path;
+    const isBinary = this.isBinaryDoc(pathToDocId(file.path));
+    // Escape hatch: skip binary push if disabled in config. Used to keep text sync working
+    // while binary push has known issues (e.g. tombstone 404 loop on resurrected files).
+    if (isBinary && this.settings.disableBinaryPush) return;
     // Serialize pushes per file to prevent concurrent 409 conflicts
     const prev = this.pushLocks.get(key) ?? Promise.resolve();
     const settled = prev.catch(() => {}); // ensure chain continues even if prev failed
     const next = settled.then(async () => {
-      if (this.isBinaryDoc(pathToDocId(file.path))) {
+      if (isBinary) {
         await this.pushBinaryFile(file);
       } else {
         await this.pushTextFile(file);
@@ -1043,8 +1049,13 @@ export class SyncEngine {
         try {
           const remote = await this.client.get(docId);
           if (remote._rev) doc._rev = remote._rev;
-        } catch {
-          // New doc, no rev needed
+        } catch (e) {
+          if (isTombstone404(e)) {
+            // Server has a tombstone — do not resurrect; delete locally and bail out
+            await this.handleRemoteDelete(docId);
+            return;
+          }
+          // Doc not found (missing, not deleted) — push as new with no _rev
         }
       }
 

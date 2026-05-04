@@ -5,6 +5,13 @@ export interface VaultSyncSettings {
   couchDbPassword: string;
   syncDebounceMs: number;
   excludePatterns: string[];
+  /**
+   * Skip binary file push entirely. Use as escape hatch when binary push
+   * is misbehaving (e.g. tombstone 404 loop on resurrected files) and
+   * blocks the daemon from reaching State: ok. Text sync continues normally.
+   * Default: false.
+   */
+  disableBinaryPush?: boolean;
 }
 
 /** Filename for plugin-managed settings at vault root */
