@@ -808,6 +808,7 @@ export class SyncEngine {
     // Batch-fetch doc metadata in chunks to avoid a single huge POST that times out
     // on slow CouchDB connections with 7000+ keys (GitHub #15).
     const hasAttachment = new Set<string>();
+    const metaFailedDocIds = new Set<string>();
     for (let offset = 0; offset < docIds.length; offset += META_BATCH_SIZE) {
       const chunk = docIds.slice(offset, offset + META_BATCH_SIZE);
       try {
@@ -818,16 +819,22 @@ export class SyncEngine {
           }
         }
       } catch (e) {
-        // Metadata chunk failed (e.g. timeout) — skip those docs, don't abort full pull.
+        // Metadata chunk failed (e.g. timeout) — track affected docs, don't abort full pull.
         console.warn(`[vault-sync] Binary metadata chunk [${offset}..${offset + chunk.length - 1}] failed: ${(e as Error).message}`);
-        // Docs in the failed chunk will remain unsynced; they will be re-attempted on next sync.
+        for (const id of chunk) metaFailedDocIds.add(id);
       }
     }
 
-    // Separate orphans (no attachment) from real downloads
+    // Classify docs: meta-fetch-failed (transient skip), real orphans (no attachment), or download
     const toDownload: string[] = [];
     for (const docId of docIds) {
-      if (!hasAttachment.has(docId)) {
+      if (metaFailedDocIds.has(docId)) {
+        // Metadata fetch failed transiently — do NOT write to revMap so the next sync retries.
+        this.pullSkipped++;
+        this.pullFetched++;
+        this.pullCount--;
+        this.emitCounts();
+      } else if (!hasAttachment.has(docId)) {
         // Binary orphan: doc exists in DB but has no attachment data.
         // Record as orphan state — no mtime field because no FS file was written.
         const rev = remoteRevs.get(docId);
