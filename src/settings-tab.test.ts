@@ -248,12 +248,14 @@ describe("VaultSyncSettingTab — diagnostics no-teardown invariant", () => {
   });
 });
 
-describe("VaultSyncSettingTab — diagnostics throttle", () => {
+describe("VaultSyncSettingTab — diagnostics throttle (rAF-based)", () => {
   let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
   let tab: VaultSyncSettingTab;
 
   beforeEach(() => {
-    vi.useFakeTimers();
+    // rAF mock replaces the old vi.useFakeTimers() approach now that coalescing
+    // uses requestAnimationFrame instead of setTimeout (iOS WKWebView fix, #39).
+    installRafMock();
     settingConstructorCount = 0;
     plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
     tab = makeTab(plugin);
@@ -262,30 +264,27 @@ describe("VaultSyncSettingTab — diagnostics throttle", () => {
 
   afterEach(() => {
     tab.hide();
-    vi.useRealTimers();
+    removeRafMock();
+    vi.clearAllTimers();
   });
 
-  it("10 rapid onDiagnosticsChange events within 100ms produce fewer than 10 renders", () => {
+  it("10 rapid onDiagnosticsChange events produce fewer than 10 renders before rAF flush", () => {
     const renderSpy = vi.spyOn(
       tab as unknown as { renderDiagnostics: () => void },
       "renderDiagnostics"
     );
 
-    // Fire 10 events via the subscribed handler (the throttled path)
+    // Fire 10 events via the subscribed handler
     for (let i = 0; i < 10; i++) {
       (plugin as unknown as { _fireListeners: () => void })._fireListeners();
     }
 
-    // Advance 100ms (within a typical 250ms throttle window)
-    vi.advanceTimersByTime(100);
-
+    // Without flushing rAF, no render has fired yet — rAF coalesces all 10 events.
     // Events must be coalesced (fewer than 10 renders for 10 rapid events)
     expect(renderSpy.mock.calls.length).toBeLessThan(10);
   });
 
-  it("the final diagnostics state IS rendered after the throttle window elapses", () => {
-    const diagnosticsEl = (tab as unknown as { diagnosticsEl: MockHTMLElement }).diagnosticsEl;
-
+  it("the final diagnostics state IS rendered after the rAF flush", () => {
     // Update diagnostics to a distinctive value
     (plugin as unknown as { _setDiagnostics: (d: Partial<SyncDiagnostics>) => void })
       ._setDiagnostics({ state: "syncing", revMapSize: 12345 });
@@ -295,8 +294,8 @@ describe("VaultSyncSettingTab — diagnostics throttle", () => {
       (plugin as unknown as { _fireListeners: () => void })._fireListeners();
     }
 
-    // Advance past the throttle window (300ms > 250ms)
-    vi.advanceTimersByTime(300);
+    // Flush the rAF — the single queued render must reflect latest state
+    flushRaf();
 
     // The pre element's textContent must reflect the latest data
     const pre = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre;
