@@ -2292,6 +2292,95 @@ describe("SyncEngine", () => {
       expect(localErrors.length).toBeGreaterThan(0);
       engine2.stop();
     });
+
+    it("meta-chunk failure does not poison revMap with false orphan (issue #32)", async () => {
+      // Regression guard: when allDocsByKeys throws during the metadata pre-fetch phase
+      // of pullBinaryDocs, the affected docs must NOT be written as state:"orphan" into
+      // revMap. Writing orphan would permanently exclude them from all future pulls via
+      // the pullAllRemote orphan guard at L705.
+      //
+      // Setup: one binary doc with a valid attachment in remote.
+      const docId = "file/a.png";
+      const remoteRev = "1-abc";
+
+      // forceFullSync clears revMap, so we use an empty store and bypass the orphan guard.
+      const store = new TestStateStore();
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: docId, key: docId, value: { rev: remoteRev } }],
+      });
+      // The metadata pre-fetch inside pullBinaryDocs throws (e.g. timeout).
+      // allDocsByKeys is also called during push tombstone check — we want to throw only
+      // on the binary metadata path. The safest discriminator is to throw when called
+      // with our specific docId, which only happens in pullBinaryDocs (the push tombstone
+      // check happens before any binary pull and with different doc sets).
+      client.allDocsByKeys.mockRejectedValue(new Error("Request timed out"));
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
+
+      // forceFullSync bypasses the orphan guard — this is the scenario for fresh installs
+      // and is also the code path users hit when triggering a manual "Force full sync".
+      await eng.forceFullSync();
+
+      // Primary assertion: the doc must NOT be recorded as orphan.
+      // An orphan entry would permanently block re-pulls on every future sync.
+      const saved = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+      const entry = saved[docId];
+      expect(entry?.state).not.toBe("orphan");
+
+      eng.stop();
+    });
+
+    it("meta-chunk failure: doc is re-pulled successfully on next sync after transient error (issue #32)", async () => {
+      // Stronger regression guard: after a transient metadata-fetch failure (first sync),
+      // the doc must be pulled to "known" on the next sync when the network recovers.
+      // This proves "re-attempted on next sync" is no longer a lie.
+      const docId = "file/a.png";
+      const remoteRev = "1-abc";
+
+      const store = new TestStateStore();
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      // First sync: allDocsByKeys always fails → doc skipped, NOT orphaned
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: docId, key: docId, value: { rev: remoteRev } }],
+      });
+      client.allDocsByKeys.mockRejectedValue(new Error("Request timed out"));
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
+
+      await eng.forceFullSync();
+
+      // After first sync: doc must not be orphan (otherwise second sync skips it)
+      const afterFirst = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+      expect(afterFirst[docId]?.state).not.toBe("orphan");
+
+      // Second sync: network recovered, allDocsByKeys succeeds and returns the attachment
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [makeBinaryAllDocsRow(docId, remoteRev)],
+      });
+      // allDocs still returns the same remote rev → still needs to be pulled (revMap has no entry)
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: docId, key: docId, value: { rev: remoteRev } }],
+      });
+      client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
+
+      await eng.forceFullSync();
+
+      // After second sync: doc must be known (attachment was downloaded)
+      const afterSecond = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+      expect(afterSecond[docId]).toMatchObject({ state: "known", rev: remoteRev });
+      expect(client.getAttachment).toHaveBeenCalledWith(docId, expect.any(String), expect.any(Number));
+
+      eng.stop();
+    });
   });
 
   describe("reconcileLocalDeletes", () => {
